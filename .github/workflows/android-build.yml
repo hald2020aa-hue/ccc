@@ -1,9 +1,3 @@
-# لتفعيل البناء التلقائي على GitHub Actions:
-# بعد رفع المشروع إلى GitHub، افتح هذا الملف في موقع GitHub، اضغط على زر التعديل (Edit)،
-# ثم غيّر اسم ومسار الملف في الأعلى إلى:
-# .github/workflows/android-build.yml
-# ثم اضغط Commit changes ليبدأ البناء التلقائي واستخراج ملف APK.
-
 name: Build Android APK
 
 on:
