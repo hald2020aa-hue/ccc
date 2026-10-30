@@ -23,6 +23,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -80,12 +83,15 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.MangaCatalogData
+import com.example.data.MangaWork
 import com.example.data.local.DownloadTaskEntity
 import com.example.data.local.FavoriteCategoryEntity
 import com.example.data.local.FavoriteEntity
 import com.example.data.local.HistoryEntity
 import com.example.data.local.SavedWorkEntity
 import com.example.data.local.SiteEntity
+import com.example.ui.components.MangaCoverArtwork
 import com.example.ui.components.SiteIconBadge
 import com.example.ui.theme.AppCardSurface
 import com.example.ui.theme.AppDialogSurface
@@ -106,6 +112,7 @@ fun StorageLibraryScreen(
     onOpenDrawer: () -> Unit,
     onImportUri: (Uri) -> Unit,
     onOpenWork: (SavedWorkEntity) -> Unit,
+    onSelectMangaWork: (MangaWork) -> Unit,
     onDeleteWork: (SavedWorkEntity) -> Unit,
     onContinueReadingClick: () -> Unit,
     onOpenDownloadsScreen: () -> Unit,
@@ -125,19 +132,21 @@ fun StorageLibraryScreen(
         }
     }
 
-    val filteredWorks = remember(savedWorks, searchQuery, sortMode) {
+    val libraryMangaWorks = remember(savedWorks, searchQuery, sortMode) {
+        val baseWorks = MangaCatalogData.storageLibraryWorks
         val matching = if (searchQuery.isBlank()) {
-            savedWorks
+            baseWorks
         } else {
-            savedWorks.filter {
+            baseWorks.filter {
                 it.title.contains(searchQuery, ignoreCase = true) ||
-                    it.sourceUrl.contains(searchQuery, ignoreCase = true)
+                    it.arabicBannerTitle.contains(searchQuery, ignoreCase = true) ||
+                    it.siteName.contains(searchQuery, ignoreCase = true)
             }
         }
         when (sortMode) {
             "الاسم" -> matching.sortedBy { it.title }
-            "الحجم" -> matching.sortedByDescending { it.fileSizeBytes }
-            else -> matching.sortedByDescending { it.createdAt }
+            "الحجم" -> matching.sortedByDescending { it.chaptersCount }
+            else -> matching
         }
     }
 
@@ -149,7 +158,7 @@ fun StorageLibraryScreen(
             .testTag("storage_screen")
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
-            // Top Bar (01:39-01:40): Menu ☰ on Right, Search 🔍 + More ⋮ on Left
+            // Top Bar (00:01): Menu ☰ on Right, Search 🔍 + More ⋮ on Left
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -250,7 +259,7 @@ fun StorageLibraryScreen(
                 }
             }
 
-            // Title Row: "التخزين" on the right, "آخر الاضافات" filter on the left (01:39)
+            // Title Row: "التخزين" on the right, "آخر الاضافات" filter on the left (00:01)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -307,130 +316,98 @@ fun StorageLibraryScreen(
                 }
             }
 
-            if (filteredWorks.isEmpty()) {
-                // Exact Empty State from 01:39-01:40:
-                // Kaomoji ( ` ‸ ´ ), "لم تحفظ اي عمل في التخزين.", and Periwinkle "استيراد" button
-                Box(
+            // Saved local files banner if the user also imported/saved individual files
+            if (savedWorks.isNotEmpty()) {
+                LazyRow(
                     modifier = Modifier
-                        .fillMaxSize()
-                        .padding(bottom = 64.dp),
-                    contentAlignment = Alignment.Center
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    contentPadding = PaddingValues(horizontal = 14.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Center
-                    ) {
-                        Text(
-                            text = "( ` ‸ ´ )",
-                            color = TextPrimaryWhite,
-                            fontSize = 46.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-
-                        Spacer(modifier = Modifier.height(18.dp))
-
-                        Text(
-                            text = "لم تحفظ اي عمل في التخزين.",
-                            color = TextPrimaryWhite,
-                            fontSize = 15.sp,
-                            fontWeight = FontWeight.Medium
-                        )
-
-                        Spacer(modifier = Modifier.height(26.dp))
-
-                        Button(
-                            onClick = {
-                                filePickerLauncher.launch(arrayOf("*/*"))
-                            },
-                            shape = RoundedCornerShape(24.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = PeriwinklePrimary,
-                                contentColor = PeriwinkleOnPrimary
-                            ),
-                            modifier = Modifier
-                                .width(126.dp)
-                                .height(46.dp)
-                                .testTag("storage_import_button")
+                    items(savedWorks, key = { it.id }) { work ->
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = AppCardSurface,
+                            modifier = Modifier.clickable { onOpenWork(work) }
                         ) {
-                            Text(
-                                text = "استيراد",
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.Bold
-                            )
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Book,
+                                    contentDescription = null,
+                                    tint = PeriwinklePrimary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = work.title,
+                                    color = TextPrimaryWhite,
+                                    fontSize = 12.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "حذف",
+                                    tint = Color(0xFFFF6B6B),
+                                    modifier = Modifier
+                                        .size(15.dp)
+                                        .clickable { onDeleteWork(work) }
+                                )
+                            }
                         }
                     }
                 }
-            } else {
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 92.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    items(filteredWorks, key = { it.id }) { work ->
-                        Card(
-                            colors = CardDefaults.cardColors(containerColor = AppCardSurface),
-                            shape = RoundedCornerShape(16.dp),
+            }
+
+            // 3-column / Adaptive Manga & Manhwa Cover Grid matching 00:01 of the 52s video
+            LazyVerticalGrid(
+                columns = GridCells.Adaptive(minSize = 104.dp),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .testTag("storage_manga_grid"),
+                contentPadding = PaddingValues(
+                    start = 12.dp,
+                    end = 12.dp,
+                    top = 6.dp,
+                    bottom = 96.dp
+                ),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                items(libraryMangaWorks, key = { it.id }) { mangaWork ->
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .clickable { onSelectMangaWork(mangaWork) }
+                            .testTag("storage_manga_card_${mangaWork.id}"),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        MangaCoverArtwork(
+                            work = mangaWork,
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable { onOpenWork(work) }
-                        ) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(16.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(46.dp)
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(Color(0xFF283044)),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Book,
-                                        contentDescription = null,
-                                        tint = PeriwinklePrimary
-                                    )
-                                }
-                                Spacer(modifier = Modifier.width(14.dp))
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = work.title,
-                                        color = TextPrimaryWhite,
-                                        fontSize = 16.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                    val typeLabel = when (work.fileType) {
-                                        "PAGE" -> "صفحة محفوظة"
-                                        "DOWNLOAD" -> "تنزيل"
-                                        else -> "ملف مستورد"
-                                    }
-                                    Text(
-                                        text = "$typeLabel • ${MainViewModel.formatBytesArabic(work.fileSizeBytes)}",
-                                        color = TextSecondaryGrey,
-                                        fontSize = 12.sp
-                                    )
-                                    Text(
-                                        text = work.localFilePath,
-                                        color = Color(0xFF73798B),
-                                        fontSize = 11.sp,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                                IconButton(onClick = { onDeleteWork(work) }) {
-                                    Icon(
-                                        imageVector = Icons.Default.Delete,
-                                        contentDescription = "حذف العمل",
-                                        tint = Color(0xFFFF6B6B)
-                                    )
-                                }
-                            }
-                        }
+                                .height(152.dp),
+                            showArabicTitleBanner = true
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = mangaWork.title,
+                            color = TextPrimaryWhite,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 2.dp)
+                        )
                     }
                 }
             }

@@ -20,6 +20,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.data.MangaCatalogData
 import com.example.ui.components.AddSiteFlowDialog
 import com.example.ui.components.AppNavigationDrawerContent
 import com.example.ui.components.BottomToastAndNoticeOverlay
@@ -34,11 +35,14 @@ import com.example.ui.screens.GeneralSettingsScreen
 import com.example.ui.screens.HistoryScreen
 import com.example.ui.screens.InAppBrowserScreen
 import com.example.ui.screens.ManageSitesScreen
+import com.example.ui.screens.MangaChapterReaderScreen
+import com.example.ui.screens.MangaDetailsScreen
 import com.example.ui.screens.MoreSettingsScreen
 import com.example.ui.screens.NewChaptersSettingsScreen
 import com.example.ui.screens.ReadingOptionsSettingsScreen
 import com.example.ui.screens.RecommendationsScreen
 import com.example.ui.screens.SettingsMainScreen
+import com.example.ui.screens.SiteCatalogScreen
 import com.example.ui.screens.StatisticsSettingsScreen
 import com.example.ui.screens.StorageLibraryScreen
 import com.example.ui.screens.StorageSettingsScreen
@@ -90,6 +94,10 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
     val browserUrl by viewModel.browserUrl.collectAsStateWithLifecycle()
     val browserTitle by viewModel.browserTitle.collectAsStateWithLifecycle()
     val isUpdatingSites by viewModel.isUpdatingSites.collectAsStateWithLifecycle()
+    val selectedSite by viewModel.selectedSite.collectAsStateWithLifecycle()
+    val selectedWork by viewModel.selectedWork.collectAsStateWithLifecycle()
+    val selectedChapter by viewModel.selectedChapter.collectAsStateWithLifecycle()
+    val downloadedChaptersMap by viewModel.downloadedChaptersMap.collectAsStateWithLifecycle()
 
     // Start with the drawer open on first launch so it matches 00:00 of the reference video
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Open)
@@ -97,6 +105,7 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
 
     val isDrawerGestureEnabled = currentScreen in setOf(
         AppScreen.STORAGE,
+        AppScreen.SITE_CATALOG,
         AppScreen.RECOMMENDATIONS,
         AppScreen.UPDATES,
         AppScreen.FAVORITES,
@@ -127,7 +136,7 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                 },
                 onOpenSiteInBrowser = { site ->
                     scope.launch { drawerState.close() }
-                    viewModel.openBrowserWithUrl(site.url, site.name)
+                    viewModel.openSiteCatalog(site)
                 },
                 onLoginClick = {
                     viewModel.setShowLoginDialog(true)
@@ -154,22 +163,109 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                                 viewModel.showToast("الملف محفوظ في: ${work.localFilePath}")
                             }
                         },
+                        onSelectMangaWork = { mangaWork ->
+                            viewModel.openMangaDetails(mangaWork)
+                        },
                         onDeleteWork = { work -> viewModel.deleteSavedWork(work) },
                         onContinueReadingClick = {
-                            val lastHistory = history.firstOrNull()
-                            if (lastHistory != null) {
-                                viewModel.openBrowserWithUrl(lastHistory.url, lastHistory.title)
-                            } else {
-                                val firstSite = enabledSites.firstOrNull()
-                                if (firstSite != null) {
-                                    viewModel.openBrowserWithUrl(firstSite.url, firstSite.name)
-                                } else {
-                                    viewModel.navigateTo(AppScreen.MANAGE_SITES)
-                                }
-                            }
+                            viewModel.openMangaDetails(selectedWork)
                         },
                         onOpenDownloadsScreen = { viewModel.navigateTo(AppScreen.DOWNLOADS) },
                         onOpenStorageSettings = { viewModel.navigateTo(AppScreen.SETTINGS_STORAGE) }
+                    )
+                }
+
+                AppScreen.SITE_CATALOG -> {
+                    val catalogWorks = MangaCatalogData.getCatalogForSite(selectedSite)
+                    SiteCatalogScreen(
+                        site = selectedSite,
+                        works = catalogWorks,
+                        showContinueReadingButton = settings.showContinueReadingButton,
+                        onOpenDrawer = { scope.launch { drawerState.open() } },
+                        onSelectWork = { work ->
+                            viewModel.openMangaDetails(work)
+                        },
+                        onContinueReadingClick = {
+                            viewModel.openMangaDetails(selectedWork)
+                        },
+                        onOpenSiteInWebView = { site ->
+                            viewModel.openBrowserWithUrl(site.url, site.name)
+                        },
+                        onShowToast = { msg -> viewModel.showToast(msg) }
+                    )
+                }
+
+                AppScreen.MANGA_DETAILS -> {
+                    val isWorkFav = favorites.any {
+                        it.title.equals(selectedWork.title, ignoreCase = true) ||
+                            it.url.contains(selectedWork.id, ignoreCase = true)
+                    }
+                    val downloadedChaptersForWork = downloadedChaptersMap[selectedWork.id] ?: emptySet()
+
+                    MangaDetailsScreen(
+                        work = selectedWork,
+                        isFavorite = isWorkFav,
+                        downloadedChapterNumbers = downloadedChaptersForWork,
+                        onBackClick = { viewModel.navigateBack() },
+                        onOpenChapter = { work, chapter ->
+                            viewModel.openMangaChapterReader(work, chapter)
+                        },
+                        onToggleFavorite = { work ->
+                            viewModel.toggleFavoritePage(
+                                title = work.title,
+                                url = "${work.siteUrl}/series/${work.id}",
+                                siteName = work.siteName
+                            )
+                        },
+                        onSaveWorkToStorage = { work ->
+                            viewModel.saveMangaWorkToStorage(work)
+                        },
+                        onDownloadChapters = { work, chaptersToDownload, toastMsg ->
+                            viewModel.downloadChaptersForWork(work, chaptersToDownload, toastMsg)
+                        },
+                        onOpenInWebView = { url, title ->
+                            viewModel.openBrowserWithUrl(url, title)
+                        },
+                        onShowToast = { msg -> viewModel.showToast(msg) }
+                    )
+                }
+
+                AppScreen.MANGA_READER -> {
+                    val isWorkFav = favorites.any {
+                        it.title.equals(selectedWork.title, ignoreCase = true) ||
+                            it.url.contains(selectedWork.id, ignoreCase = true)
+                    }
+
+                    MangaChapterReaderScreen(
+                        work = selectedWork,
+                        chapter = selectedChapter,
+                        settings = settings,
+                        isFavorite = isWorkFav,
+                        onBackClick = { viewModel.navigateBack() },
+                        onSelectChapter = { targetChapter ->
+                            viewModel.openMangaChapterReader(selectedWork, targetChapter)
+                        },
+                        onToggleFavorite = { work ->
+                            viewModel.toggleFavoritePage(
+                                title = work.title,
+                                url = "${work.siteUrl}/series/${work.id}",
+                                siteName = work.siteName
+                            )
+                        },
+                        onDownloadChapter = { work, chapter ->
+                            viewModel.downloadChaptersForWork(
+                                work = work,
+                                chapters = listOf(chapter),
+                                toastMsg = "تم حفظ ${chapter.title} في التخزين"
+                            )
+                        },
+                        onUpdateWebtoonMode = { enabled ->
+                            viewModel.setBooleanSetting("webtoonAlwaysOn", enabled)
+                        },
+                        onOpenReadingSettings = {
+                            viewModel.navigateTo(AppScreen.SETTINGS_READING_OPTIONS)
+                        },
+                        onShowToast = { msg -> viewModel.showToast(msg) }
                     )
                 }
 
@@ -186,7 +282,7 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                             viewModel.openBrowserWithUrl("https://www.google.com", "Google")
                         },
                         onOpenSiteInBrowser = { site ->
-                            viewModel.openBrowserWithUrl(site.url, site.name)
+                            viewModel.openSiteCatalog(site)
                         },
                         onToggleSiteEnabled = { site, enabled ->
                             viewModel.toggleSiteEnabled(site, enabled)
@@ -230,7 +326,7 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                     RecommendationsScreen(
                         enabledSites = enabledSites,
                         onOpenDrawer = { scope.launch { drawerState.open() } },
-                        onOpenSite = { site -> viewModel.openBrowserWithUrl(site.url, site.name) },
+                        onOpenSite = { site -> viewModel.openSiteCatalog(site) },
                         onOpenManageSites = { viewModel.navigateTo(AppScreen.MANAGE_SITES) }
                     )
                 }
@@ -241,7 +337,7 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         isChecking = isUpdatingSites,
                         onOpenDrawer = { scope.launch { drawerState.open() } },
                         onRefreshUpdates = { viewModel.checkSitesForUpdates() },
-                        onOpenSite = { site -> viewModel.openBrowserWithUrl(site.url, site.name) }
+                        onOpenSite = { site -> viewModel.openSiteCatalog(site) }
                     )
                 }
 
@@ -250,7 +346,9 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         favorites = favorites,
                         categories = categories,
                         onOpenDrawer = { scope.launch { drawerState.open() } },
-                        onOpenFavoriteUrl = { url, title -> viewModel.openBrowserWithUrl(url, title) },
+                        onOpenFavoriteUrl = { _, _ ->
+                            viewModel.openMangaDetails(selectedWork)
+                        },
                         onRemoveFavorite = { fav -> viewModel.removeFavorite(fav) },
                         onManageCategories = { viewModel.navigateTo(AppScreen.SETTINGS_FAVORITE_CATEGORIES) }
                     )
@@ -260,7 +358,9 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                     HistoryScreen(
                         historyItems = history,
                         onOpenDrawer = { scope.launch { drawerState.open() } },
-                        onOpenHistoryUrl = { url, title -> viewModel.openBrowserWithUrl(url, title) },
+                        onOpenHistoryUrl = { _, _ ->
+                            viewModel.openMangaDetails(selectedWork)
+                        },
                         onDeleteHistoryItem = { id -> viewModel.deleteHistoryEntry(id) },
                         onClearAllHistory = { viewModel.clearAllHistory() }
                     )

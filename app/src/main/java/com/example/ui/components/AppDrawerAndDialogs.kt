@@ -114,7 +114,6 @@ fun SiteIconBadge(
                 Canvas(modifier = Modifier.fillMaxSize(0.75f)) {
                     val w = this.size.width
                     val h = this.size.height
-                    // Red M strokes
                     val redPath = Path().apply {
                         moveTo(w * 0.1f, h * 0.85f)
                         lineTo(w * 0.1f, h * 0.15f)
@@ -127,7 +126,6 @@ fun SiteIconBadge(
                         color = Color(0xFFD93829),
                         style = Stroke(width = w * 0.18f, cap = StrokeCap.Round)
                     )
-                    // Blue accent bar on right leg
                     drawLine(
                         color = Color(0xFF2874A6),
                         start = Offset(w * 0.72f, h * 0.55f),
@@ -139,7 +137,7 @@ fun SiteIconBadge(
             }
         }
         iconKey == "teamx" || siteName.contains("Team-X", ignoreCase = true) || siteName.contains("olympu", ignoreCase = true) -> {
-            // Exact dark circle/rounded badge with red & silver X from 01:04-01:07
+            // Exact dark circle/rounded badge with red & silver X from 00:06 & 00:25
             Box(
                 modifier = modifier
                     .size(size)
@@ -173,6 +171,87 @@ fun SiteIconBadge(
                         cap = StrokeCap.Round
                     )
                 }
+            }
+        }
+        iconKey == "mangadar" || siteName.contains("MangaDar", ignoreCase = true) -> {
+            Box(
+                modifier = modifier
+                    .size(size)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xFF5E35B1)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Book,
+                    contentDescription = siteName,
+                    tint = Color.White,
+                    modifier = Modifier.fillMaxSize(0.65f)
+                )
+            }
+        }
+        iconKey == "azora" || siteName.contains("ازورا") || siteName.contains("Azora", ignoreCase = true) -> {
+            Box(
+                modifier = modifier
+                    .size(size)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xFF211A16))
+                    .border(1.dp, Color(0xFFFF8F00), RoundedCornerShape(8.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "🔥",
+                    fontSize = (size.value * 0.52f).sp
+                )
+            }
+        }
+        iconKey == "mangatek" || siteName.contains("مانجاتك") || siteName.contains("Mangatek", ignoreCase = true) -> {
+            Box(
+                modifier = modifier
+                    .size(size)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xFF1E1A1D))
+                    .border(1.dp, Color(0xFFFF5722), RoundedCornerShape(8.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "M",
+                    color = Color(0xFFFF7043),
+                    fontWeight = FontWeight.ExtraBold,
+                    fontSize = (size.value * 0.55f).sp
+                )
+            }
+        }
+        iconKey == "procomic" || siteName.contains("ProComic", ignoreCase = true) -> {
+            Box(
+                modifier = modifier
+                    .size(size)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xFF1565C0)),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "P",
+                    color = Color.White,
+                    fontWeight = FontWeight.ExtraBold,
+                    fontSize = (size.value * 0.55f).sp
+                )
+            }
+        }
+        iconKey == "swat" || siteName.contains("Swat", ignoreCase = true) -> {
+            Box(
+                modifier = modifier
+                    .size(size)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xFF263238))
+                    .border(1.dp, Color(0xFF90A4AE), RoundedCornerShape(8.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "S",
+                    color = Color(0xFFECEFF1),
+                    fontWeight = FontWeight.ExtraBold,
+                    fontSize = (size.value * 0.55f).sp
+                )
             }
         }
         else -> {
@@ -306,8 +385,15 @@ fun AppNavigationDrawerContent(
                 onClick = { onSelectScreen(AppScreen.MANAGE_SITES) }
             )
 
-            // Added Sites Section (00:48, 01:06, 01:38)
-            if (enabledSites.isNotEmpty()) {
+            // Added Sites Section (00:02 - 00:06 in reference video)
+            val drawerSites = remember(enabledSites) {
+                val customDomains = enabledSites.map { it.domain.lowercase() }.toSet()
+                enabledSites + com.example.data.MangaCatalogData.defaultAddedSites.filter {
+                    it.domain.lowercase() !in customDomains
+                }
+            }
+
+            if (drawerSites.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(8.dp))
                 HorizontalDivider(color = AppDividerColor, thickness = 1.dp)
                 Spacer(modifier = Modifier.height(10.dp))
@@ -320,7 +406,7 @@ fun AppNavigationDrawerContent(
                     modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp)
                 )
 
-                enabledSites.forEach { site ->
+                drawerSites.forEach { site ->
                     val drawerSiteLabel = if (site.domain.contains("mangalik") && !site.name.contains("Mangalek", ignoreCase = true)) {
                         "مانجا ليك Mangalek"
                     } else {

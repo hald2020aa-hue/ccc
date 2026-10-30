@@ -35,8 +35,17 @@ jobs:
 
       - name: Prepare .env and debug.keystore
         run: |
+          if [ ! -f ".env.example" ]; then
+            touch .env.example
+          fi
+          if [ ! -f "app/.env.example" ]; then
+            touch app/.env.example
+          fi
           if [ ! -f ".env" ]; then
             cp .env.example .env || touch .env
+          fi
+          if [ ! -f "app/.env" ]; then
+            cp app/.env.example app/.env || touch app/.env
           fi
           if [ ! -f "debug.keystore" ]; then
             keytool -genkeypair -v \

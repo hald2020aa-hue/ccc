@@ -5,6 +5,9 @@ import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.example.data.MangaCatalogData
+import com.example.data.MangaChapter
+import com.example.data.MangaWork
 import com.example.data.local.AppDatabase
 import com.example.data.local.DownloadTaskEntity
 import com.example.data.local.FavoriteCategoryEntity
@@ -27,6 +30,9 @@ import java.text.DecimalFormat
 
 enum class AppScreen {
     STORAGE,
+    SITE_CATALOG,
+    MANGA_DETAILS,
+    MANGA_READER,
     RECOMMENDATIONS,
     UPDATES,
     FAVORITES,
@@ -98,6 +104,22 @@ class MainViewModel(private val repository: AppRepository) : ViewModel() {
 
     private val _browserTitle = MutableStateFlow("Google")
     val browserTitle: StateFlow<String> = _browserTitle.asStateFlow()
+
+    private val _selectedSite = MutableStateFlow(MangaCatalogData.defaultAddedSites[6]) // Team-X default
+    val selectedSite: StateFlow<SiteEntity> = _selectedSite.asStateFlow()
+
+    private val _selectedWork = MutableStateFlow(
+        MangaCatalogData.getCatalogForSite(MangaCatalogData.defaultAddedSites[6]).first()
+    )
+    val selectedWork: StateFlow<MangaWork> = _selectedWork.asStateFlow()
+
+    private val _selectedChapter = MutableStateFlow(
+        MangaCatalogData.getCatalogForSite(MangaCatalogData.defaultAddedSites[6]).first().chapters.first()
+    )
+    val selectedChapter: StateFlow<MangaChapter> = _selectedChapter.asStateFlow()
+
+    private val _downloadedChaptersMap = MutableStateFlow<Map<String, Set<Int>>>(emptyMap())
+    val downloadedChaptersMap: StateFlow<Map<String, Set<Int>>> = _downloadedChaptersMap.asStateFlow()
 
     private val _addSiteDialogState = MutableStateFlow<AddSiteDialogState>(AddSiteDialogState.Hidden)
     val addSiteDialogState: StateFlow<AddSiteDialogState> = _addSiteDialogState.asStateFlow()
@@ -193,6 +215,69 @@ class MainViewModel(private val repository: AppRepository) : ViewModel() {
         viewModelScope.launch {
             repository.addHistory(title = title, url = url, siteName = siteName)
             repository.addReadingSeconds(15L)
+        }
+    }
+
+    // Native Site Catalog, Manga Details, and Chapter Reader Navigation (matching 00:02 - 00:52)
+    fun openSiteCatalog(site: SiteEntity) {
+        _selectedSite.value = site
+        navigateTo(AppScreen.SITE_CATALOG)
+    }
+
+    fun openMangaDetails(work: MangaWork) {
+        _selectedWork.value = work
+        if (work.chapters.isNotEmpty()) {
+            _selectedChapter.value = work.chapters.first()
+        }
+        recordPageVisit(
+            title = work.title,
+            url = "${work.siteUrl}/series/${work.id}",
+            siteName = work.siteName
+        )
+        navigateTo(AppScreen.MANGA_DETAILS)
+    }
+
+    fun openMangaChapterReader(work: MangaWork, chapter: MangaChapter) {
+        _selectedWork.value = work
+        _selectedChapter.value = chapter
+        recordPageVisit(
+            title = "${work.title} - ${chapter.title}",
+            url = "${work.siteUrl}/series/${work.id}/chapter-${chapter.number}",
+            siteName = work.siteName
+        )
+        navigateTo(AppScreen.MANGA_READER)
+    }
+
+    fun downloadChaptersForWork(work: MangaWork, chapters: List<MangaChapter>, toastMsg: String) {
+        if (chapters.isEmpty()) return
+        viewModelScope.launch {
+            if (settings.value.downloadWifiOnly && !repository.isWifiConnected()) {
+                showToast("التنزيل عبر شبكة Wi-Fi فقط مفعّل في الإعدادات")
+                return@launch
+            }
+            val currentMap = _downloadedChaptersMap.value.toMutableMap()
+            val existingSet = currentMap[work.id]?.toMutableSet() ?: mutableSetOf()
+            chapters.forEach { existingSet.add(it.number) }
+            currentMap[work.id] = existingSet
+            _downloadedChaptersMap.value = currentMap
+
+            showToast(toastMsg)
+            repository.saveWebPageToStorage(
+                title = "${work.title} (${chapters.size} فصل)",
+                url = "${work.siteUrl}/series/${work.id}"
+            )
+            refreshStorageStats()
+        }
+    }
+
+    fun saveMangaWorkToStorage(work: MangaWork) {
+        viewModelScope.launch {
+            repository.saveWebPageToStorage(
+                title = work.title,
+                url = "${work.siteUrl}/series/${work.id}"
+            )
+            refreshStorageStats()
+            showToast("تم حفظ ${work.title} في التخزين")
         }
     }
 

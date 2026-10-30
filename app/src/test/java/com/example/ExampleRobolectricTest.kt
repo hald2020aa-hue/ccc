@@ -42,4 +42,39 @@ class ExampleRobolectricTest {
         composeTestRule.onNodeWithTag("empty_add_site_button").assertIsDisplayed()
         composeTestRule.onNodeWithTag("empty_browser_button").assertIsDisplayed()
     }
+
+    @Test
+    fun verifyNativeSiteCatalogDetailsAndChapterReaderFlow() {
+        // Drawer is open initially showing المواقع المضافة including Team-X (id = 107L)
+        composeTestRule.onNodeWithTag("navigation_drawer").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("drawer_added_site_107")
+            .performScrollTo()
+            .performClick()
+
+        // Advance clock so the 3-stage loading completes and shows the native SiteCatalogScreen grid
+        composeTestRule.mainClock.advanceTimeBy(1200)
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("site_catalog_screen").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("site_works_grid").assertIsDisplayed()
+
+        // Tap "High-martial world..." card to open MangaDetailsScreen
+        composeTestRule.onNodeWithTag("manga_card_high_martial_world")
+            .performClick()
+
+        composeTestRule.mainClock.advanceTimeBy(800)
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("manga_details_screen").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("details_favorite_button").assertIsDisplayed()
+
+        // Tap Chapter 1 to open MangaChapterReaderScreen
+        composeTestRule.onNodeWithTag("chapter_row_1")
+            .performClick()
+
+        composeTestRule.mainClock.advanceTimeBy(1600)
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("manga_chapter_reader_screen").assertIsDisplayed()
+    }
 }
