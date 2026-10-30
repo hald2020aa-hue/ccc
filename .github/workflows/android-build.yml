@@ -24,13 +24,17 @@ jobs:
       - name: Configure Android SDK and Licenses
         run: |
           export ANDROID_SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          sudo chmod -R a+rwx "$ANDROID_SDK_ROOT" || true
           mkdir -p "$ANDROID_SDK_ROOT/licenses"
-          printf "\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n" > "$ANDROID_SDK_ROOT/licenses/android-sdk-license"
+          printf "\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n859f317696f67ef3d7f30a50a5560e7834b43903\n" > "$ANDROID_SDK_ROOT/licenses/android-sdk-license"
           printf "\n84831b9409646a918e30573bab4c9c91346d8abd\n504667f4c0de7af1a06de9f4b1727b84351f2910\n" > "$ANDROID_SDK_ROOT/licenses/android-sdk-preview-license"
-          SDKMANAGER=$(find "$ANDROID_SDK_ROOT" -name sdkmanager -type f | head -n 1)
+          SDKMANAGER=$(find "$ANDROID_SDK_ROOT" -name sdkmanager -type f | sort -V | tail -n 1)
           if [ -n "$SDKMANAGER" ]; then
             yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
-            "$SDKMANAGER" --install "platforms;android-36.1" "platforms;android-36" "build-tools;36.0.0" > /dev/null 2>&1 || true
+            "$SDKMANAGER" --install "platform-tools" > /dev/null 2>&1 || true
+            "$SDKMANAGER" --install "build-tools;36.0.0" > /dev/null 2>&1 || true
+            "$SDKMANAGER" --install "platforms;android-36" > /dev/null 2>&1 || true
+            "$SDKMANAGER" --install "platforms;android-36.1" > /dev/null 2>&1 || true
           fi
 
       - name: Prepare .env and debug.keystore
@@ -65,7 +69,7 @@ jobs:
           gradle-version: '9.3.1'
 
       - name: Build Debug APK
-        run: gradle :app:assembleDebug --no-daemon
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
