@@ -98,6 +98,8 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
     val selectedWork by viewModel.selectedWork.collectAsStateWithLifecycle()
     val selectedChapter by viewModel.selectedChapter.collectAsStateWithLifecycle()
     val downloadedChaptersMap by viewModel.downloadedChaptersMap.collectAsStateWithLifecycle()
+    val readChaptersMap by viewModel.readChaptersMap.collectAsStateWithLifecycle()
+    val readingProgressMap by viewModel.readingProgressMap.collectAsStateWithLifecycle()
 
     // Start with the drawer open on first launch so it matches 00:00 of the reference video
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Open)
@@ -129,6 +131,8 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                 currentScreen = currentScreen,
                 enabledSites = enabledSites,
                 userProfileName = settings.userProfileName,
+                userProfileEmail = settings.userProfileEmail,
+                selectedSiteId = selectedSite.id,
                 showSiteIcons = settings.showSiteIcons,
                 onSelectScreen = { target ->
                     scope.launch { drawerState.close() }
@@ -168,7 +172,7 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         },
                         onDeleteWork = { work -> viewModel.deleteSavedWork(work) },
                         onContinueReadingClick = {
-                            viewModel.openMangaDetails(selectedWork)
+                            viewModel.resumeReadingCurrentOrLastWork()
                         },
                         onOpenDownloadsScreen = { viewModel.navigateTo(AppScreen.DOWNLOADS) },
                         onOpenStorageSettings = { viewModel.navigateTo(AppScreen.SETTINGS_STORAGE) }
@@ -186,7 +190,7 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                             viewModel.openMangaDetails(work)
                         },
                         onContinueReadingClick = {
-                            viewModel.openMangaDetails(selectedWork)
+                            viewModel.resumeReadingCurrentOrLastWork()
                         },
                         onOpenSiteInWebView = { site ->
                             viewModel.openBrowserWithUrl(site.url, site.name)
@@ -201,11 +205,14 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                             it.url.contains(selectedWork.id, ignoreCase = true)
                     }
                     val downloadedChaptersForWork = downloadedChaptersMap[selectedWork.id] ?: emptySet()
+                    val readChaptersForWork = readChaptersMap[selectedWork.id] ?: emptySet()
 
                     MangaDetailsScreen(
                         work = selectedWork,
                         isFavorite = isWorkFav,
                         downloadedChapterNumbers = downloadedChaptersForWork,
+                        readChapterNumbers = readChaptersForWork,
+                        addedSites = enabledSites,
                         onBackClick = { viewModel.navigateBack() },
                         onOpenChapter = { work, chapter ->
                             viewModel.openMangaChapterReader(work, chapter)
@@ -213,7 +220,7 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         onToggleFavorite = { work ->
                             viewModel.toggleFavoritePage(
                                 title = work.title,
-                                url = "${work.siteUrl}/series/${work.id}",
+                                url = work.mangaUrl.ifBlank { "${work.siteUrl}/series/${work.id}" },
                                 siteName = work.siteName
                             )
                         },
@@ -226,6 +233,9 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         onOpenInWebView = { url, title ->
                             viewModel.openBrowserWithUrl(url, title)
                         },
+                        onSelectSiteForSearch = { site ->
+                            viewModel.openSiteCatalog(site)
+                        },
                         onShowToast = { msg -> viewModel.showToast(msg) }
                     )
                 }
@@ -235,12 +245,19 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         it.title.equals(selectedWork.title, ignoreCase = true) ||
                             it.url.contains(selectedWork.id, ignoreCase = true)
                     }
+                    val savedPageIndex = readingProgressMap[selectedWork.id]
+                        ?.takeIf { it.first == selectedChapter.number }
+                        ?.second ?: 0
 
                     MangaChapterReaderScreen(
                         work = selectedWork,
                         chapter = selectedChapter,
                         settings = settings,
                         isFavorite = isWorkFav,
+                        initialPageIndex = savedPageIndex,
+                        onSaveReadingProgress = { pageIdx ->
+                            viewModel.saveReadingProgress(selectedWork, selectedChapter, pageIdx)
+                        },
                         onBackClick = { viewModel.navigateBack() },
                         onSelectChapter = { targetChapter ->
                             viewModel.openMangaChapterReader(selectedWork, targetChapter)
@@ -248,7 +265,7 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         onToggleFavorite = { work ->
                             viewModel.toggleFavoritePage(
                                 title = work.title,
-                                url = "${work.siteUrl}/series/${work.id}",
+                                url = work.mangaUrl.ifBlank { "${work.siteUrl}/series/${work.id}" },
                                 siteName = work.siteName
                             )
                         },

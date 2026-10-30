@@ -133,13 +133,24 @@ fun StorageLibraryScreen(
     }
 
     val libraryMangaWorks = remember(savedWorks, searchQuery, sortMode) {
-        val baseWorks = MangaCatalogData.storageLibraryWorks
+        val baseWorks = savedWorks.map { saved ->
+            MangaWork(
+                id = "saved_${saved.id}",
+                title = saved.title,
+                arabicBannerTitle = "",
+                siteName = "التخزين",
+                siteUrl = saved.sourceUrl.substringBefore("/series").ifBlank { saved.sourceUrl },
+                siteIconKey = "globe",
+                mangaUrl = saved.sourceUrl,
+                coverImageUrl = "",
+                chaptersCount = 0
+            )
+        }
         val matching = if (searchQuery.isBlank()) {
             baseWorks
         } else {
             baseWorks.filter {
                 it.title.contains(searchQuery, ignoreCase = true) ||
-                    it.arabicBannerTitle.contains(searchQuery, ignoreCase = true) ||
                     it.siteName.contains(searchQuery, ignoreCase = true)
             }
         }
@@ -316,98 +327,82 @@ fun StorageLibraryScreen(
                 }
             }
 
-            // Saved local files banner if the user also imported/saved individual files
-            if (savedWorks.isNotEmpty()) {
-                LazyRow(
+            if (libraryMangaWorks.isEmpty()) {
+                Box(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 4.dp),
-                    contentPadding = PaddingValues(horizontal = 14.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        .fillMaxSize()
+                        .padding(horizontal = 32.dp),
+                    contentAlignment = Alignment.Center
                 ) {
-                    items(savedWorks, key = { it.id }) { work ->
-                        Surface(
-                            shape = RoundedCornerShape(12.dp),
-                            color = AppCardSurface,
-                            modifier = Modifier.clickable { onOpenWork(work) }
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Book,
-                                    contentDescription = null,
-                                    tint = PeriwinklePrimary,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = work.title,
-                                    color = TextPrimaryWhite,
-                                    fontSize = 12.sp,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Icon(
-                                    imageVector = Icons.Default.Close,
-                                    contentDescription = "حذف",
-                                    tint = Color(0xFFFF6B6B),
-                                    modifier = Modifier
-                                        .size(15.dp)
-                                        .clickable { onDeleteWork(work) }
-                                )
-                            }
-                        }
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(
+                            imageVector = Icons.Default.Book,
+                            contentDescription = null,
+                            tint = Color(0xFF4C505E),
+                            modifier = Modifier.size(84.dp)
+                        )
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Text(
+                            text = "لا توجد أعمال محفوظة في التخزين حالياً",
+                            color = TextPrimaryWhite,
+                            fontSize = 17.sp,
+                            fontWeight = FontWeight.Bold,
+                            textAlign = TextAlign.Center
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "قم بإضافة مواقع المانجا من قسم «إدارة المواقع» في القائمة الجانبية لتصفح الأعمال وتنزيل الفصول مباشرة من الموقع.",
+                            color = TextSecondaryGrey,
+                            fontSize = 13.sp,
+                            textAlign = TextAlign.Center
+                        )
                     }
                 }
-            }
-
-            // 3-column / Adaptive Manga & Manhwa Cover Grid matching 00:01 of the 52s video
-            LazyVerticalGrid(
-                columns = GridCells.Adaptive(minSize = 104.dp),
-                modifier = Modifier
-                    .fillMaxSize()
-                    .testTag("storage_manga_grid"),
-                contentPadding = PaddingValues(
-                    start = 12.dp,
-                    end = 12.dp,
-                    top = 6.dp,
-                    bottom = 96.dp
-                ),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp)
-            ) {
-                items(libraryMangaWorks, key = { it.id }) { mangaWork ->
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(10.dp))
-                            .clickable { onSelectMangaWork(mangaWork) }
-                            .testTag("storage_manga_card_${mangaWork.id}"),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        MangaCoverArtwork(
-                            work = mangaWork,
+            } else {
+                LazyVerticalGrid(
+                    columns = GridCells.Adaptive(minSize = 104.dp),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .testTag("storage_manga_grid"),
+                    contentPadding = PaddingValues(
+                        start = 12.dp,
+                        end = 12.dp,
+                        top = 6.dp,
+                        bottom = 96.dp
+                    ),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    items(libraryMangaWorks, key = { it.id }) { mangaWork ->
+                        Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(152.dp),
-                            showArabicTitleBanner = true
-                        )
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text(
-                            text = mangaWork.title,
-                            color = TextPrimaryWhite,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Medium,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 2.dp)
-                        )
+                                .clip(RoundedCornerShape(10.dp))
+                                .clickable { onSelectMangaWork(mangaWork) }
+                                .testTag("storage_manga_card_${mangaWork.id}"),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            MangaCoverArtwork(
+                                work = mangaWork,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(152.dp),
+                                showArabicTitleBanner = false
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = mangaWork.title,
+                                color = TextPrimaryWhite,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 2.dp)
+                            )
+                        }
                     }
                 }
             }

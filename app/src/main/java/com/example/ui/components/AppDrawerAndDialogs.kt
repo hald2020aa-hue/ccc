@@ -279,6 +279,8 @@ fun AppNavigationDrawerContent(
     currentScreen: AppScreen,
     enabledSites: List<SiteEntity>,
     userProfileName: String,
+    userProfileEmail: String = "",
+    selectedSiteId: Long? = null,
     showSiteIcons: Boolean,
     onSelectScreen: (AppScreen) -> Unit,
     onOpenSiteInBrowser: (SiteEntity) -> Unit,
@@ -299,7 +301,7 @@ fun AppNavigationDrawerContent(
                 .verticalScroll(rememberScrollState())
                 .padding(vertical = 12.dp)
         ) {
-            // Top Profile Header (00:00, 00:48, 01:06)
+            // Top Profile Header (00:02 - 00:05 of reference video)
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -322,13 +324,39 @@ fun AppNavigationDrawerContent(
                         modifier = Modifier.size(60.dp)
                     )
                 }
-                Spacer(modifier = Modifier.height(12.dp))
-                Text(
-                    text = if (userProfileName.isBlank()) "انقر هنا لتسجيل الدخول" else userProfileName,
-                    color = TextPrimaryWhite,
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.Medium
-                )
+                Spacer(modifier = Modifier.height(10.dp))
+
+                if (userProfileName.isNotBlank()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = userProfileName,
+                            color = TextPrimaryWhite,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    if (userProfileEmail.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = userProfileEmail,
+                            color = TextSecondaryGrey,
+                            fontSize = 12.sp
+                        )
+                    }
+                } else {
+                    Text(
+                        text = "انقر هنا لتسجيل الدخول",
+                        color = TextPrimaryWhite,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.height(6.dp))
@@ -385,13 +413,8 @@ fun AppNavigationDrawerContent(
                 onClick = { onSelectScreen(AppScreen.MANAGE_SITES) }
             )
 
-            // Added Sites Section (00:02 - 00:06 in reference video)
-            val drawerSites = remember(enabledSites) {
-                val customDomains = enabledSites.map { it.domain.lowercase() }.toSet()
-                enabledSites + com.example.data.MangaCatalogData.defaultAddedSites.filter {
-                    it.domain.lowercase() !in customDomains
-                }
-            }
+            // Added Sites Section (only user-added sites)
+            val drawerSites = enabledSites
 
             if (drawerSites.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(8.dp))
@@ -412,11 +435,13 @@ fun AppNavigationDrawerContent(
                     } else {
                         site.name
                     }
+                    val isSiteActive = currentScreen == AppScreen.SITE_CATALOG && selectedSiteId == site.id
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 12.dp, vertical = 2.dp)
                             .clip(RoundedCornerShape(28.dp))
+                            .background(if (isSiteActive) AppDrawerSelectedPill else Color.Transparent)
                             .clickable { onOpenSiteInBrowser(site) }
                             .padding(horizontal = 14.dp, vertical = 12.dp)
                             .testTag("drawer_added_site_${site.id}"),
@@ -432,9 +457,9 @@ fun AppNavigationDrawerContent(
                         }
                         Text(
                             text = drawerSiteLabel,
-                            color = TextPrimaryWhite,
+                            color = if (isSiteActive) PeriwinklePrimary else TextPrimaryWhite,
                             fontSize = 15.sp,
-                            fontWeight = FontWeight.SemiBold,
+                            fontWeight = if (isSiteActive) FontWeight.Bold else FontWeight.SemiBold,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )

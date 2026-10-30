@@ -8,7 +8,6 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -42,6 +41,7 @@ import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.ScreenRotation
+import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Tune
@@ -87,10 +87,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.LiveMangaSiteScraper
 import com.example.data.MangaChapter
 import com.example.data.MangaWork
 import com.example.data.preferences.UserSettings
 import com.example.ui.components.ChapterPageIllustration
+import com.example.ui.components.CloudflareProtectionDialog
+import com.example.ui.components.HiddenSiteWebViewBridge
 import com.example.ui.theme.AppDialogSurface
 import com.example.ui.theme.PeriwinkleOnPrimary
 import com.example.ui.theme.PeriwinklePrimary
@@ -108,6 +111,8 @@ fun MangaChapterReaderScreen(
     chapter: MangaChapter,
     settings: UserSettings,
     isFavorite: Boolean,
+    initialPageIndex: Int = 0,
+    onSaveReadingProgress: (Int) -> Unit = {},
     onBackClick: () -> Unit,
     onSelectChapter: (MangaChapter) -> Unit,
     onToggleFavorite: (MangaWork) -> Unit,
@@ -117,22 +122,75 @@ fun MangaChapterReaderScreen(
     onShowToast: (String) -> Unit
 ) {
     val scope = rememberCoroutineScope()
-    val totalPages = chapter.pageCount.coerceAtLeast(8)
 
-    // Smooth loading sequence matching 00:39 - 00:47:
-    // ٣٪ -> ١٦٪ -> ٢٧٪ -> ٥١٪ -> ٧٤٪ -> ٩٧٪ -> Loaded!
-    var loadingProgress by remember(chapter.id) { mutableIntStateOf(3) }
-    var isChapterLoaded by remember(chapter.id) { mutableStateOf(false) }
-
-    LaunchedEffect(chapter.id) {
-        isChapterLoaded = false
-        val steps = listOf(3, 16, 27, 51, 57, 74, 79, 97, 100)
-        for (pct in steps) {
-            loadingProgress = pct
-            delay(110)
-        }
-        isChapterLoaded = true
+    var livePageUrls by remember(chapter.id, chapter.chapterUrl) {
+        mutableStateOf(chapter.pageImageUrls)
     }
+    var loadingProgress by remember(chapter.id, chapter.chapterUrl) { mutableIntStateOf(3) }
+    var isChapterLoaded by remember(chapter.id, chapter.chapterUrl) {
+        mutableStateOf(chapter.pageImageUrls.isNotEmpty())
+    }
+    var requiresCloudflare by remember(chapter.id, chapter.chapterUrl) { mutableStateOf(false) }
+    var showProtectionModal by remember { mutableStateOf(false) }
+    var refreshTrigger by remember { mutableIntStateOf(0) }
+
+    val targetChapterUrl = remember(chapter.chapterUrl, work.siteUrl, work.id, chapter.number) {
+        chapter.chapterUrl.ifBlank {
+            "${work.siteUrl.trimEnd('/')}/series/${work.id}/${chapter.number}"
+        }
+    }
+
+    // Fetch live chapter page image URLs directly from the website while animating progress (00:39 - 00:47)
+    LaunchedEffect(chapter.id, targetChapterUrl, refreshTrigger) {
+        if (livePageUrls.isEmpty() || refreshTrigger > 0) {
+            isChapterLoaded = false
+            loadingProgress = 3
+            delay(90)
+            loadingProgress = 16
+            delay(90)
+            loadingProgress = 27
+            val res = LiveMangaSiteScraper.fetchChapterPages(work, chapter.copy(chapterUrl = targetChapterUrl))
+            loadingProgress = 57
+            delay(90)
+            loadingProgress = 79
+            if (res.pageUrls.isNotEmpty()) {
+                livePageUrls = res.pageUrls
+                requiresCloudflare = false
+                loadingProgress = 100
+                isChapterLoaded = true
+            } else if (res.requiresCloudflare) {
+                requiresCloudflare = true
+                loadingProgress = 97
+                isChapterLoaded = true
+            } else {
+                loadingProgress = 97
+                // Give HiddenSiteWebViewBridge a moment to extract lazy-loaded DOM images
+                delay(1200)
+                isChapterLoaded = true
+            }
+        }
+    }
+
+    // Hidden WebView DOM Bridge to extract chapter images rendered by JS (e.g. ts_reader / Madara lazy images)
+    HiddenSiteWebViewBridge(
+        targetUrl = targetChapterUrl,
+        jsExtractorScript = LiveMangaSiteScraper.JS_EXTRACT_CHAPTER_PAGES,
+        reloadTrigger = refreshTrigger,
+        onResultJson = { rawJson ->
+            val domRes = LiveMangaSiteScraper.parseChapterPagesFromDomJson(rawJson, targetChapterUrl)
+            if (domRes.pageUrls.isNotEmpty()) {
+                livePageUrls = domRes.pageUrls
+                requiresCloudflare = false
+                loadingProgress = 100
+                isChapterLoaded = true
+            } else if (domRes.requiresCloudflare && livePageUrls.isEmpty()) {
+                requiresCloudflare = true
+                isChapterLoaded = true
+            }
+        }
+    )
+
+    val totalPages = livePageUrls.size.coerceAtLeast(1)
 
     var showReaderHud by remember { mutableStateOf(true) }
     var showQuickTunePopup by remember { mutableStateOf(false) }
@@ -142,22 +200,31 @@ fun MangaChapterReaderScreen(
     var zoomScale by remember { mutableFloatStateOf(1f) }
     var isWebtoonMode by remember(settings.webtoonAlwaysOn) { mutableStateOf(settings.webtoonAlwaysOn) }
 
-    val webtoonListState = rememberLazyListState()
-    val pagerState = rememberPagerState(pageCount = { totalPages })
+    val webtoonListState = rememberLazyListState(
+        initialFirstVisibleItemIndex = initialPageIndex.coerceAtLeast(0)
+    )
+    val pagerState = rememberPagerState(
+        initialPage = initialPageIndex.coerceAtLeast(0),
+        pageCount = { totalPages }
+    )
 
     val currentPageIndex by remember {
         derivedStateOf {
             if (isWebtoonMode) {
-                webtoonListState.firstVisibleItemIndex.coerceIn(0, totalPages - 1)
+                webtoonListState.firstVisibleItemIndex.coerceIn(0, (totalPages - 1).coerceAtLeast(0))
             } else {
-                pagerState.currentPage.coerceIn(0, totalPages - 1)
+                pagerState.currentPage.coerceIn(0, (totalPages - 1).coerceAtLeast(0))
             }
         }
     }
 
+    LaunchedEffect(currentPageIndex) {
+        onSaveReadingProgress(currentPageIndex)
+    }
+
     // Auto-scroll support if enabled in settings
-    LaunchedEffect(settings.autoScroll, isChapterLoaded, isWebtoonMode) {
-        if (settings.autoScroll && isChapterLoaded && isWebtoonMode) {
+    LaunchedEffect(settings.autoScroll, isChapterLoaded, isWebtoonMode, totalPages) {
+        if (settings.autoScroll && isChapterLoaded && isWebtoonMode && livePageUrls.isNotEmpty()) {
             while (true) {
                 delay(1800)
                 val next = (webtoonListState.firstVisibleItemIndex + 1).coerceAtMost(totalPages - 1)
@@ -167,16 +234,12 @@ fun MangaChapterReaderScreen(
     }
 
     val commentsList = remember {
-        mutableStateListOf(
-            "أسطورة الفصل! الرسم والحماس في هذا العمل خيالي 🔥" to "منذ ساعة",
-            "شكراً لفريق Team-X على الترجمة السريعة والجودة العالية" to "منذ 3 ساعات",
-            "تقنية الرمح المائي في الصفحة الثانية رهيبة جداً!" to "منذ 5 ساعات"
-        )
+        mutableStateListOf<Pair<String, String>>()
     }
     var newCommentText by remember { mutableStateOf("") }
 
     fun jumpToPage(targetIndex: Int) {
-        val clamped = targetIndex.coerceIn(0, totalPages - 1)
+        val clamped = targetIndex.coerceIn(0, (totalPages - 1).coerceAtLeast(0))
         scope.launch {
             if (isWebtoonMode) {
                 webtoonListState.animateScrollToItem(clamped)
@@ -184,6 +247,13 @@ fun MangaChapterReaderScreen(
                 pagerState.animateScrollToPage(clamped)
             }
         }
+    }
+
+    val prevChapter = remember(work.chapters, chapter.number) {
+        work.chapters.find { it.number == chapter.number - 1 }
+    }
+    val nextChapter = remember(work.chapters, chapter.number) {
+        work.chapters.find { it.number == chapter.number + 1 }
     }
 
     Box(
@@ -210,7 +280,7 @@ fun MangaChapterReaderScreen(
             }
             .testTag("manga_chapter_reader_screen")
     ) {
-        // ==================== MAIN READER AREA (LOADING OR PAGES) ====================
+        // ==================== MAIN READER AREA (LOADING OR LIVE CHAPTER PAGES) ====================
         if (!isChapterLoaded) {
             // Exact Loading Screen from 00:39 - 00:47:
             // "التحميل: ٢٧٪" + Horizontal LinearProgressIndicator
@@ -246,9 +316,58 @@ fun MangaChapterReaderScreen(
                     }
                 }
             }
+        } else if (livePageUrls.isEmpty()) {
+            // Prompt to verify Cloudflare or reload chapter images from website
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(24.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Security,
+                        contentDescription = null,
+                        tint = PeriwinklePrimary,
+                        modifier = Modifier.size(48.dp)
+                    )
+                    Text(
+                        text = if (requiresCloudflare) {
+                            "يتطلب الفصل تخطي حماية Cloudflare لتحميل صور المانجا من الموقع"
+                        } else {
+                            "تعذر استخراج صور الفصل تلقائياً — افتح نافذة الحماية لتحميل الصفحات مباشرة"
+                        },
+                        color = TextPrimaryWhite,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Button(
+                            onClick = { showProtectionModal = true },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = PeriwinklePrimary,
+                                contentColor = PeriwinkleOnPrimary
+                            )
+                        ) {
+                            Icon(Icons.Default.Security, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("تخطي الحماية وجلب الصور", fontWeight = FontWeight.Bold)
+                        }
+                        OutlinedButton(onClick = { refreshTrigger++ }) {
+                            Icon(Icons.Default.Refresh, contentDescription = null, tint = TextPrimaryWhite, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("إعادة المحاولة", color = TextPrimaryWhite)
+                        }
+                    }
+                }
+            }
         } else {
             if (isWebtoonMode) {
-                // Continuous Vertical Webtoon Strip (00:48 - 00:52)
+                // Continuous Vertical Webtoon Strip displaying real website page images (00:48 - 00:52)
                 LazyColumn(
                     state = webtoonListState,
                     modifier = Modifier
@@ -260,12 +379,14 @@ fun MangaChapterReaderScreen(
                         .testTag("reader_webtoon_list"),
                     contentPadding = PaddingValues(bottom = 32.dp)
                 ) {
-                    items(totalPages, key = { "page_$it" }) { pageIdx ->
+                    items(livePageUrls.size, key = { "page_$it" }) { pageIdx ->
                         ChapterPageIllustration(
                             work = work,
                             chapterNumber = chapter.number,
                             pageIndex = pageIdx,
-                            totalPages = totalPages
+                            totalPages = livePageUrls.size,
+                            pageImageUrl = livePageUrls[pageIdx],
+                            refererUrl = targetChapterUrl
                         )
                     }
 
@@ -286,29 +407,10 @@ fun MangaChapterReaderScreen(
                                 fontWeight = FontWeight.Bold
                             )
 
-                            if (settings.showCommentsAtEnd) {
-                                OutlinedButton(
-                                    onClick = { showCommentsDialog = true },
-                                    shape = RoundedCornerShape(22.dp),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Icon(Icons.AutoMirrored.Filled.Comment, null, tint = PeriwinklePrimary)
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text(
-                                        text = "عرض التعليقات (${commentsList.size})",
-                                        color = PeriwinklePrimary,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-                            }
-
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(12.dp)
                             ) {
-                                val nextChapter = work.chapters.find { it.number == chapter.number + 1 }
-                                val prevChapter = work.chapters.find { it.number == chapter.number - 1 }
-
                                 if (prevChapter != null) {
                                     OutlinedButton(
                                         onClick = { onSelectChapter(prevChapter) },
@@ -353,7 +455,9 @@ fun MangaChapterReaderScreen(
                                 work = work,
                                 chapterNumber = chapter.number,
                                 pageIndex = pageIdx,
-                                totalPages = totalPages
+                                totalPages = livePageUrls.size,
+                                pageImageUrl = livePageUrls.getOrNull(pageIdx),
+                                refererUrl = targetChapterUrl
                             )
                         }
                     }
@@ -401,17 +505,39 @@ fun MangaChapterReaderScreen(
                         )
                     }
 
-                    Text(
-                        text = work.title,
-                        color = TextPrimaryWhite,
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
+                    Column(
                         modifier = Modifier
                             .weight(1f)
                             .padding(horizontal = 6.dp)
-                    )
+                    ) {
+                        Text(
+                            text = work.title,
+                            color = TextPrimaryWhite,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = chapter.title,
+                            color = TextSecondaryGrey,
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    IconButton(
+                        onClick = { showProtectionModal = true },
+                        modifier = Modifier.testTag("reader_protection_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Security,
+                            contentDescription = "حماية الموقع",
+                            tint = if (requiresCloudflare) Color(0xFFFFB74D) else PeriwinklePrimary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
 
                     IconButton(
                         onClick = { showCommentsDialog = true },
@@ -548,13 +674,12 @@ fun MangaChapterReaderScreen(
                                 // Left circular button: Previous Chapter
                                 Surface(
                                     shape = CircleShape,
-                                    color = Color(0xFF232734),
+                                    color = if (prevChapter != null) Color(0xFF232734) else Color(0xFF191C24),
                                     modifier = Modifier
                                         .size(40.dp)
                                         .clickable {
-                                            val prev = work.chapters.find { it.number == chapter.number - 1 }
-                                            if (prev != null) {
-                                                onSelectChapter(prev)
+                                            if (prevChapter != null) {
+                                                onSelectChapter(prevChapter)
                                             } else {
                                                 onShowToast("أنت في الفصل الأول")
                                             }
@@ -565,7 +690,7 @@ fun MangaChapterReaderScreen(
                                         Icon(
                                             imageVector = Icons.Default.SkipPrevious,
                                             contentDescription = "الفصل السابق",
-                                            tint = TextPrimaryWhite,
+                                            tint = if (prevChapter != null) TextPrimaryWhite else TextSecondaryGrey.copy(alpha = 0.45f),
                                             modifier = Modifier.size(20.dp)
                                         )
                                     }
@@ -583,7 +708,7 @@ fun MangaChapterReaderScreen(
                                 ) {
                                     // Subtle page dots along the track
                                     Canvas(modifier = Modifier.fillMaxWidth().height(8.dp)) {
-                                        val count = totalPages.coerceAtLeast(2)
+                                        val count = totalPages.coerceIn(2, 24)
                                         val step = size.width / (count - 1)
                                         for (i in 0 until count) {
                                             drawCircle(
@@ -610,13 +735,12 @@ fun MangaChapterReaderScreen(
                                 // Right circular button: Next Chapter
                                 Surface(
                                     shape = CircleShape,
-                                    color = Color(0xFF232734),
+                                    color = if (nextChapter != null) Color(0xFF232734) else Color(0xFF191C24),
                                     modifier = Modifier
                                         .size(40.dp)
                                         .clickable {
-                                            val next = work.chapters.find { it.number == chapter.number + 1 }
-                                            if (next != null) {
-                                                onSelectChapter(next)
+                                            if (nextChapter != null) {
+                                                onSelectChapter(nextChapter)
                                             } else {
                                                 onShowToast("هذا هو أحدث فصل متاح")
                                             }
@@ -627,7 +751,7 @@ fun MangaChapterReaderScreen(
                                         Icon(
                                             imageVector = Icons.Default.SkipNext,
                                             contentDescription = "الفصل التالي",
-                                            tint = TextPrimaryWhite,
+                                            tint = if (nextChapter != null) TextPrimaryWhite else TextSecondaryGrey.copy(alpha = 0.45f),
                                             modifier = Modifier.size(20.dp)
                                         )
                                     }
@@ -660,7 +784,15 @@ fun MangaChapterReaderScreen(
                                 }
 
                                 IconButton(
-                                    onClick = { onDownloadChapter(work, chapter) },
+                                    onClick = {
+                                        onDownloadChapter(
+                                            work,
+                                            chapter.copy(
+                                                pageImageUrls = livePageUrls,
+                                                pageCount = livePageUrls.size
+                                            )
+                                        )
+                                    },
                                     modifier = Modifier.testTag("reader_save_chapter_button")
                                 ) {
                                     Icon(
@@ -760,7 +892,7 @@ fun MangaChapterReaderScreen(
         }
     }
 
-    // Chapter Comments Dialog ("💬" button in Top Bar or End of Chapter)
+    // Chapter Comments Dialog
     if (showCommentsDialog) {
         AlertDialog(
             onDismissRequest = { showCommentsDialog = false },
@@ -770,16 +902,24 @@ fun MangaChapterReaderScreen(
             },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    commentsList.forEach { (comment, time) ->
-                        Surface(
-                            color = Color(0xFF232734),
-                            shape = RoundedCornerShape(10.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Column(modifier = Modifier.padding(10.dp)) {
-                                Text(comment, color = TextPrimaryWhite, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text(time, color = TextSecondaryGrey, fontSize = 11.sp)
+                    if (commentsList.isEmpty()) {
+                        Text(
+                            text = "لا توجد تعليقات مضافة بعد على هذا الفصل.",
+                            color = TextSecondaryGrey,
+                            fontSize = 13.sp
+                        )
+                    } else {
+                        commentsList.forEach { (comment, time) ->
+                            Surface(
+                                color = Color(0xFF232734),
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(10.dp)) {
+                                    Text(comment, color = TextPrimaryWhite, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(time, color = TextSecondaryGrey, fontSize = 11.sp)
+                                }
                             }
                         }
                     }
@@ -816,7 +956,7 @@ fun MangaChapterReaderScreen(
         )
     }
 
-    // Pages & Chapters Grid Jumper Dialog ("⊞" button in Top Bar)
+    // Pages Grid Jumper Dialog ("⊞" button in Top Bar)
     if (showPagesGridDialog) {
         AlertDialog(
             onDismissRequest = { showPagesGridDialog = false },
@@ -831,7 +971,7 @@ fun MangaChapterReaderScreen(
                         color = TextSecondaryGrey,
                         fontSize = 13.sp
                     )
-                    (1..totalPages).chunked(4).forEach { rowPages ->
+                    (1..totalPages.coerceAtMost(40)).chunked(4).forEach { rowPages ->
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -861,6 +1001,27 @@ fun MangaChapterReaderScreen(
                 TextButton(onClick = { showPagesGridDialog = false }) {
                     Text("إغلاق", color = PeriwinklePrimary)
                 }
+            }
+        )
+    }
+
+    // Interactive Cloudflare Protection & Live DOM Extraction Modal
+    if (showProtectionModal) {
+        CloudflareProtectionDialog(
+            url = targetChapterUrl,
+            siteName = work.siteName,
+            jsExtractorScript = LiveMangaSiteScraper.JS_EXTRACT_CHAPTER_PAGES,
+            onExtractedDomJson = { rawJson ->
+                val domRes = LiveMangaSiteScraper.parseChapterPagesFromDomJson(rawJson, targetChapterUrl)
+                if (domRes.pageUrls.isNotEmpty()) {
+                    livePageUrls = domRes.pageUrls
+                    requiresCloudflare = false
+                    isChapterLoaded = true
+                }
+            },
+            onDismissAndRefresh = {
+                showProtectionModal = false
+                refreshTrigger++
             }
         )
     }

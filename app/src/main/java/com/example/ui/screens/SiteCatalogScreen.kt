@@ -23,13 +23,11 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Book
-import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.Menu
@@ -40,7 +38,6 @@ import androidx.compose.material.icons.filled.Security
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -64,20 +61,22 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.LiveMangaSiteScraper
 import com.example.data.MangaCatalogData
 import com.example.data.MangaWork
 import com.example.data.local.SiteEntity
+import com.example.ui.components.CloudflareProtectionDialog
+import com.example.ui.components.HiddenSiteWebViewBridge
 import com.example.ui.components.MangaCoverArtwork
-import com.example.ui.components.MangaPlaceholderCoverBox
 import com.example.ui.theme.AppDialogSurface
 import com.example.ui.theme.PeriwinkleOnPrimary
 import com.example.ui.theme.PeriwinklePrimary
 import com.example.ui.theme.TextPrimaryWhite
 import com.example.ui.theme.TextSecondaryGrey
-import kotlinx.coroutines.delay
 
 @Composable
 fun SiteCatalogScreen(
@@ -91,6 +90,7 @@ fun SiteCatalogScreen(
     onShowToast: (String) -> Unit
 ) {
     var searchQuery by remember { mutableStateOf("") }
+    var submittedSearchQuery by remember { mutableStateOf("") }
     var showSearchBar by remember { mutableStateOf(false) }
     var selectedGenre by remember { mutableStateOf<String?>(null) }
     var sortMode by remember { mutableStateOf("آخر التحديثات") }
@@ -98,40 +98,76 @@ fun SiteCatalogScreen(
     var showCategoriesDialog by remember { mutableStateOf(false) }
     var showProtectionDialog by remember { mutableStateOf(false) }
 
-    // 3-stage loading effect matching 00:07 -> 00:11 -> 00:15 of the reference video:
-    // Stage 0: Center circular refresh icon (00:07-00:10)
-    // Stage 1: Placeholder cards grid with titles (00:11-00:12)
-    // Stage 2: Full covers loaded into cards (00:13-00:15)
-    var loadStage by remember(site.id, site.url) { mutableIntStateOf(0) }
+    var liveWorks by remember(site.id, site.url) { mutableStateOf(works) }
+    var isLoadingCatalog by remember(site.id, site.url) { mutableStateOf(true) }
+    var requiresCloudflare by remember(site.id, site.url) { mutableStateOf(false) }
+    var errorMessage by remember(site.id, site.url) { mutableStateOf<String?>(null) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
-    LaunchedEffect(site.id, site.url, refreshTrigger) {
-        loadStage = 0
-        delay(280)
-        loadStage = 1
-        delay(260)
-        loadStage = 2
+
+    val targetCatalogUrl = remember(site.url, submittedSearchQuery, selectedGenre) {
+        LiveMangaSiteScraper.buildCatalogTargetUrl(
+            site = site,
+            searchQuery = submittedSearchQuery,
+            selectedGenre = selectedGenre
+        )
     }
 
-    val filteredWorks = remember(works, searchQuery, selectedGenre, sortMode) {
-        val byQuery = if (searchQuery.isBlank()) {
-            works
+    // Fetch live manga list directly from the added website
+    LaunchedEffect(site.id, site.url, submittedSearchQuery, selectedGenre, refreshTrigger) {
+        isLoadingCatalog = true
+        errorMessage = null
+        val result = LiveMangaSiteScraper.fetchSiteCatalog(
+            site = site,
+            searchQuery = submittedSearchQuery,
+            selectedGenre = selectedGenre
+        )
+        if (result.works.isNotEmpty()) {
+            liveWorks = result.works
+            requiresCloudflare = false
+            isLoadingCatalog = false
+        } else if (result.requiresCloudflare) {
+            requiresCloudflare = true
+            errorMessage = result.errorMessage
+            isLoadingCatalog = false
         } else {
-            works.filter {
-                it.title.contains(searchQuery, ignoreCase = true) ||
-                    it.arabicBannerTitle.contains(searchQuery, ignoreCase = true) ||
-                    it.description.contains(searchQuery, ignoreCase = true)
+            errorMessage = result.errorMessage
+            // Keep loading briefly while HiddenSiteWebViewBridge extracts DOM via JS
+            kotlinx.coroutines.delay(1400)
+            isLoadingCatalog = false
+        }
+    }
+
+    // Background WebView DOM extractor for JS-rendered or Cloudflare-cookie sites
+    HiddenSiteWebViewBridge(
+        targetUrl = targetCatalogUrl,
+        jsExtractorScript = LiveMangaSiteScraper.JS_EXTRACT_CATALOG,
+        reloadTrigger = refreshTrigger,
+        onResultJson = { rawJson ->
+            val domResult = LiveMangaSiteScraper.parseCatalogFromDomJson(rawJson, site)
+            if (domResult.works.isNotEmpty()) {
+                liveWorks = domResult.works
+                requiresCloudflare = false
+                errorMessage = null
+                isLoadingCatalog = false
+            } else if (domResult.requiresCloudflare && liveWorks.isEmpty()) {
+                requiresCloudflare = true
+                isLoadingCatalog = false
             }
         }
-        val byGenre = if (selectedGenre.isNullOrBlank()) {
-            byQuery
+    )
+
+    val displayedWorks = remember(liveWorks, searchQuery, sortMode) {
+        val byLocalSearch = if (searchQuery.isBlank()) {
+            liveWorks
         } else {
-            byQuery.filter { work -> work.genres.any { it.contains(selectedGenre!!, ignoreCase = true) } }
-                .ifEmpty { byQuery }
+            liveWorks.filter {
+                it.title.contains(searchQuery, ignoreCase = true)
+            }
         }
         when (sortMode) {
-            "الأكثر شعبية" -> byGenre.sortedByDescending { it.chaptersCount }
-            "الأبجدية" -> byGenre.sortedBy { it.title }
-            else -> byGenre
+            "الأبجدية" -> byLocalSearch.sortedBy { it.title }
+            "الأكثر شعبية" -> byLocalSearch.reversed()
+            else -> byLocalSearch
         }
     }
 
@@ -166,7 +202,12 @@ fun SiteCatalogScreen(
                 if (showSearchBar) {
                     OutlinedTextField(
                         value = searchQuery,
-                        onValueChange = { searchQuery = it },
+                        onValueChange = {
+                            searchQuery = it
+                            if (it.length >= 3 || it.isEmpty()) {
+                                submittedSearchQuery = it
+                            }
+                        },
                         placeholder = { Text("ابحث في ${site.name}...", fontSize = 13.sp) },
                         singleLine = true,
                         colors = OutlinedTextFieldDefaults.colors(
@@ -181,8 +222,12 @@ fun SiteCatalogScreen(
                             .testTag("site_catalog_search_input")
                     )
                     IconButton(onClick = {
-                        searchQuery = ""
-                        showSearchBar = false
+                        if (searchQuery.isNotEmpty()) {
+                            searchQuery = ""
+                            submittedSearchQuery = ""
+                        } else {
+                            showSearchBar = false
+                        }
                     }) {
                         Icon(Icons.Default.Close, contentDescription = "إغلاق البحث", tint = TextPrimaryWhite)
                     }
@@ -205,7 +250,7 @@ fun SiteCatalogScreen(
                             Icon(
                                 imageVector = Icons.Default.Security,
                                 contentDescription = "الحماية وتخطي Cloudflare",
-                                tint = PeriwinklePrimary
+                                tint = if (requiresCloudflare) Color(0xFFFFB74D) else PeriwinklePrimary
                             )
                         }
                         IconButton(
@@ -336,18 +381,77 @@ fun SiteCatalogScreen(
                 }
             }
 
-            // Content Area: Stage 0 Spinner (00:07-00:10) -> Stage 1/2 Grid (00:11-00:15)
-            if (loadStage == 0) {
+            // Content Area:
+            // 1. Loading Spinner (00:07-00:10)
+            // 2. Cloudflare / Empty / Retry State if blocked or offline
+            // 3. Live Works Grid with Real Website Covers (00:11-00:15)
+            if (isLoadingCatalog && displayedWorks.isEmpty()) {
                 Box(
                     modifier = Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center
                 ) {
                     Icon(
                         imageVector = Icons.Default.Refresh,
-                        contentDescription = "جار التحميل",
+                        contentDescription = "جار التحميل من الموقع",
                         tint = Color(0xFF8C92A4),
                         modifier = Modifier.size(64.dp)
                     )
+                }
+            } else if (displayedWorks.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(24.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (requiresCloudflare) Icons.Default.Security else Icons.Default.Refresh,
+                            contentDescription = null,
+                            tint = PeriwinklePrimary,
+                            modifier = Modifier.size(54.dp)
+                        )
+                        Text(
+                            text = if (requiresCloudflare) {
+                                "الموقع محمي بواسطة Cloudflare — اضغط لتفعيل الحماية وجلب المانجا مباشرة"
+                            } else {
+                                errorMessage ?: "جاري جلب قائمة المانجا من الموقع أو لم يتم العثور على نتائج"
+                            },
+                            color = TextPrimaryWhite,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Bold,
+                            textAlign = TextAlign.Center
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Button(
+                                onClick = { showProtectionDialog = true },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = PeriwinklePrimary,
+                                    contentColor = PeriwinkleOnPrimary
+                                )
+                            ) {
+                                Icon(Icons.Default.Security, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("تخطي الحماية (Cloudflare)", fontWeight = FontWeight.Bold)
+                            }
+                            OutlinedButton(
+                                onClick = { refreshTrigger++ },
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimaryWhite)
+                            ) {
+                                Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("إعادة المحاولة")
+                            }
+                        }
+                        TextButton(onClick = { onOpenSiteInWebView(site) }) {
+                            Icon(Icons.Default.OpenInBrowser, contentDescription = null, tint = PeriwinklePrimary, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("فتح الموقع في المتصفح الداخلي", color = PeriwinklePrimary)
+                        }
+                    }
                 }
             } else {
                 LazyVerticalGrid(
@@ -359,27 +463,20 @@ fun SiteCatalogScreen(
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                     verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
-                    items(filteredWorks, key = { it.id }) { work ->
+                    items(displayedWorks.size, key = { idx -> "${displayedWorks[idx].id}_$idx" }) { index ->
+                        val work = displayedWorks[index]
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clickable { onSelectWork(work) }
                                 .testTag("manga_card_${work.id}")
                         ) {
-                            if (loadStage == 1) {
-                                MangaPlaceholderCoverBox(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .aspectRatio(0.71f)
-                                )
-                            } else {
-                                MangaCoverArtwork(
-                                    work = work,
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .aspectRatio(0.71f)
-                                )
-                            }
+                            MangaCoverArtwork(
+                                work = work,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .aspectRatio(0.71f)
+                            )
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
                                 text = work.title,
@@ -448,7 +545,7 @@ fun SiteCatalogScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "اختر التصنيف لعرض المانجا والمانهوا المطابقة:",
+                        text = "اختر التصنيف لجلب الأعمال المطابقة مباشرة من الموقع:",
                         color = TextSecondaryGrey,
                         fontSize = 13.sp
                     )
@@ -496,64 +593,24 @@ fun SiteCatalogScreen(
         )
     }
 
-    // Protection (الحماية / Cloudflare Bypass) Dialog
+    // Interactive Cloudflare Protection & Live DOM Verification Modal
     if (showProtectionDialog) {
-        AlertDialog(
-            onDismissRequest = { showProtectionDialog = false },
-            containerColor = AppDialogSurface,
-            icon = {
-                Icon(
-                    imageVector = Icons.Default.CheckCircle,
-                    contentDescription = null,
-                    tint = Color(0xFF4CAF50),
-                    modifier = Modifier.size(40.dp)
-                )
-            },
-            title = {
-                Text("حماية الموقع (Cloudflare)", color = TextPrimaryWhite, fontWeight = FontWeight.Bold)
-            },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        text = "حالة الاتصال بموقع «${site.name}»: متصل ومفعل داخل التطبيق بدون حظر.",
-                        color = TextPrimaryWhite,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    Text(
-                        text = "يقوم التطبيق تلقائياً بتخطي حماية Cloudflare وتحويل صفحات المانجا والمانهوا إلى واجهة التطبيق الأصلية مع دعم تحميل الفصول والقراءة المباشرة.",
-                        color = TextSecondaryGrey,
-                        fontSize = 13.sp,
-                        lineHeight = 19.sp
-                    )
+        CloudflareProtectionDialog(
+            url = targetCatalogUrl,
+            siteName = site.name,
+            jsExtractorScript = LiveMangaSiteScraper.JS_EXTRACT_CATALOG,
+            onExtractedDomJson = { rawJson ->
+                val domResult = LiveMangaSiteScraper.parseCatalogFromDomJson(rawJson, site)
+                if (domResult.works.isNotEmpty()) {
+                    liveWorks = domResult.works
+                    requiresCloudflare = false
+                    errorMessage = null
                 }
             },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        showProtectionDialog = false
-                        refreshTrigger++
-                        onShowToast("تم تحديث جلسة الحماية بنجاح")
-                    },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = PeriwinklePrimary,
-                        contentColor = PeriwinkleOnPrimary
-                    )
-                ) {
-                    Text("تحديث الجلسة", fontWeight = FontWeight.Bold)
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = {
-                        showProtectionDialog = false
-                        onOpenSiteInWebView(site)
-                    }
-                ) {
-                    Icon(Icons.Default.OpenInBrowser, null, tint = PeriwinklePrimary, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("فتح في المتصفح", color = PeriwinklePrimary)
-                }
+            onDismissAndRefresh = {
+                showProtectionDialog = false
+                refreshTrigger++
+                onShowToast("تم تحديث جلسة الحماية وجلب المانجا من الموقع")
             }
         )
     }

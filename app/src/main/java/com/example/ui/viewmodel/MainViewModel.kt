@@ -105,21 +105,30 @@ class MainViewModel(private val repository: AppRepository) : ViewModel() {
     private val _browserTitle = MutableStateFlow("Google")
     val browserTitle: StateFlow<String> = _browserTitle.asStateFlow()
 
-    private val _selectedSite = MutableStateFlow(MangaCatalogData.defaultAddedSites[6]) // Team-X default
+    private val _selectedSite = MutableStateFlow(
+        SiteEntity(id = 0L, name = "", url = "", domain = "", iconKey = "globe")
+    )
     val selectedSite: StateFlow<SiteEntity> = _selectedSite.asStateFlow()
 
     private val _selectedWork = MutableStateFlow(
-        MangaCatalogData.getCatalogForSite(MangaCatalogData.defaultAddedSites[6]).first()
+        MangaWork(id = "", title = "", siteName = "", siteUrl = "", siteIconKey = "globe")
     )
     val selectedWork: StateFlow<MangaWork> = _selectedWork.asStateFlow()
 
     private val _selectedChapter = MutableStateFlow(
-        MangaCatalogData.getCatalogForSite(MangaCatalogData.defaultAddedSites[6]).first().chapters.first()
+        MangaChapter(id = "", number = 1, title = "الفصل 1", dateText = "")
     )
     val selectedChapter: StateFlow<MangaChapter> = _selectedChapter.asStateFlow()
 
     private val _downloadedChaptersMap = MutableStateFlow<Map<String, Set<Int>>>(emptyMap())
     val downloadedChaptersMap: StateFlow<Map<String, Set<Int>>> = _downloadedChaptersMap.asStateFlow()
+
+    private val _readChaptersMap = MutableStateFlow<Map<String, Set<Int>>>(emptyMap())
+    val readChaptersMap: StateFlow<Map<String, Set<Int>>> = _readChaptersMap.asStateFlow()
+
+    // Maps work.id -> Pair(lastReadChapterNumber, lastReadPageIndex)
+    private val _readingProgressMap = MutableStateFlow<Map<String, Pair<Int, Int>>>(emptyMap())
+    val readingProgressMap: StateFlow<Map<String, Pair<Int, Int>>> = _readingProgressMap.asStateFlow()
 
     private val _addSiteDialogState = MutableStateFlow<AddSiteDialogState>(AddSiteDialogState.Hidden)
     val addSiteDialogState: StateFlow<AddSiteDialogState> = _addSiteDialogState.asStateFlow()
@@ -231,7 +240,7 @@ class MainViewModel(private val repository: AppRepository) : ViewModel() {
         }
         recordPageVisit(
             title = work.title,
-            url = "${work.siteUrl}/series/${work.id}",
+            url = work.mangaUrl.ifBlank { "${work.siteUrl}/series/${work.id}" },
             siteName = work.siteName
         )
         navigateTo(AppScreen.MANGA_DETAILS)
@@ -240,15 +249,67 @@ class MainViewModel(private val repository: AppRepository) : ViewModel() {
     fun openMangaChapterReader(work: MangaWork, chapter: MangaChapter) {
         _selectedWork.value = work
         _selectedChapter.value = chapter
+
+        val currentReadMap = _readChaptersMap.value.toMutableMap()
+        val readSet = currentReadMap[work.id]?.toMutableSet() ?: mutableSetOf()
+        readSet.add(chapter.number)
+        currentReadMap[work.id] = readSet
+        _readChaptersMap.value = currentReadMap
+
+        val currentProgressMap = _readingProgressMap.value.toMutableMap()
+        val existingPage = currentProgressMap[work.id]?.takeIf { it.first == chapter.number }?.second ?: 0
+        currentProgressMap[work.id] = chapter.number to existingPage
+        _readingProgressMap.value = currentProgressMap
+
         recordPageVisit(
             title = "${work.title} - ${chapter.title}",
-            url = "${work.siteUrl}/series/${work.id}/chapter-${chapter.number}",
+            url = chapter.chapterUrl.ifBlank { "${work.siteUrl}/series/${work.id}/chapter-${chapter.number}" },
             siteName = work.siteName
         )
         navigateTo(AppScreen.MANGA_READER)
     }
 
-    fun downloadChaptersForWork(work: MangaWork, chapters: List<MangaChapter>, toastMsg: String) {
+    fun saveReadingProgress(work: MangaWork, chapter: MangaChapter, pageIndex: Int) {
+        val currentProgressMap = _readingProgressMap.value.toMutableMap()
+        currentProgressMap[work.id] = chapter.number to pageIndex.coerceAtLeast(0)
+        _readingProgressMap.value = currentProgressMap
+
+        val currentReadMap = _readChaptersMap.value.toMutableMap()
+        val readSet = currentReadMap[work.id]?.toMutableSet() ?: mutableSetOf()
+        readSet.add(chapter.number)
+        currentReadMap[work.id] = readSet
+        _readChaptersMap.value = currentReadMap
+    }
+
+    fun resumeReadingCurrentOrLastWork() {
+        val work = _selectedWork.value
+        if (work.id.isBlank() && work.mangaUrl.isBlank()) {
+            val firstSite = enabledSites.value.firstOrNull()
+            if (firstSite != null) {
+                openSiteCatalog(firstSite)
+            } else {
+                showToast("أضف موقع مانجا أولاً من إدارة المواقع لبدء القراءة")
+                navigateTo(AppScreen.MANAGE_SITES)
+            }
+            return
+        }
+        val savedProgress = _readingProgressMap.value[work.id]
+        if (savedProgress != null) {
+            val targetCh = work.chapters.find { it.number == savedProgress.first } ?: work.chapters.firstOrNull()
+            if (targetCh != null) {
+                openMangaChapterReader(work, targetCh)
+                return
+            }
+        }
+        openMangaDetails(work)
+    }
+
+    fun downloadChaptersForWork(
+        work: MangaWork,
+        chapters: List<MangaChapter>,
+        toastMsg: String,
+        quality: String = "عالية (الأصلية)"
+    ) {
         if (chapters.isEmpty()) return
         viewModelScope.launch {
             if (settings.value.downloadWifiOnly && !repository.isWifiConnected()) {
@@ -262,10 +323,16 @@ class MainViewModel(private val repository: AppRepository) : ViewModel() {
             _downloadedChaptersMap.value = currentMap
 
             showToast(toastMsg)
-            repository.saveWebPageToStorage(
-                title = "${work.title} (${chapters.size} فصل)",
-                url = "${work.siteUrl}/series/${work.id}"
-            )
+            // Persist offline package for up to 10 chapters immediately so DownloadsScreen & StorageStats update
+            chapters.take(10).forEach { ch ->
+                repository.downloadMangaChapterOffline(work, ch, quality)
+            }
+            if (chapters.size > 10) {
+                repository.saveWebPageToStorage(
+                    title = "${work.title} (${chapters.size} فصل)",
+                    url = "${work.siteUrl}/series/${work.id}"
+                )
+            }
             refreshStorageStats()
         }
     }
@@ -558,6 +625,43 @@ class MainViewModel(private val repository: AppRepository) : ViewModel() {
     fun deleteDownloadTask(task: DownloadTaskEntity) {
         viewModelScope.launch {
             repository.deleteDownloadTask(task)
+            refreshStorageStats()
+            showToast("تم حذف النسخة المحلية")
+        }
+    }
+
+    fun togglePauseDownloadTask(task: DownloadTaskEntity) {
+        viewModelScope.launch {
+            repository.togglePauseDownloadTask(task)
+            showToast(if (task.status == "PAUSED") "تم استئناف التنزيل" else "تم إيقاف التنزيل مؤقتاً")
+        }
+    }
+
+    fun retryDownloadTask(task: DownloadTaskEntity) {
+        viewModelScope.launch {
+            repository.retryFailedDownloadTask(task)
+            refreshStorageStats()
+            showToast("تمت إعادة تنزيل الفصل بنجاح")
+        }
+    }
+
+    fun openDownloadedTaskInReader(task: DownloadTaskEntity) {
+        // Parse manga://{workId}/chapter/{chapterNumber} if present
+        if (task.url.startsWith("manga://")) {
+            val path = task.url.removePrefix("manga://")
+            val workId = path.substringBefore("/chapter/")
+            val chNum = path.substringAfter("/chapter/").toIntOrNull() ?: 1
+            val allWorks = MangaCatalogData.defaultAddedSites.flatMap { MangaCatalogData.getCatalogForSite(it) } +
+                MangaCatalogData.storageLibraryWorks
+            val matchedWork = allWorks.find { it.id == workId } ?: _selectedWork.value
+            val matchedChapter = matchedWork.chapters.find { it.number == chNum }
+                ?: matchedWork.chapters.firstOrNull()
+                ?: _selectedChapter.value
+            openMangaChapterReader(matchedWork, matchedChapter)
+        } else {
+            val matchedWork = _selectedWork.value
+            val matchedChapter = matchedWork.chapters.firstOrNull() ?: _selectedChapter.value
+            openMangaChapterReader(matchedWork, matchedChapter)
         }
     }
 
