@@ -1,6 +1,7 @@
 package com.example.ui.components
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.graphics.Bitmap
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -48,14 +49,21 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import coil.ImageLoader
 import coil.compose.SubcomposeAsyncImage
+import coil.request.CachePolicy
 import coil.request.ImageRequest
+import com.example.data.DiagnosticCategory
+import com.example.data.DiagnosticLogger
 import com.example.data.LiveMangaSiteScraper
 import com.example.data.MangaWork
 import com.example.ui.theme.AppDialogSurface
@@ -63,25 +71,112 @@ import com.example.ui.theme.PeriwinkleOnPrimary
 import com.example.ui.theme.PeriwinklePrimary
 import com.example.ui.theme.TextPrimaryWhite
 import com.example.ui.theme.TextSecondaryGrey
+import okhttp3.Dispatcher
+import okhttp3.OkHttpClient
 import java.io.File
+import java.util.concurrent.TimeUnit
+
+/**
+ * Shared Coil ImageLoader with bounded concurrency and automatic User-Agent, Referer, and Cookie headers
+ * so loading 20-60 chapter images in a LazyColumn never overwhelms the host or fails due to missing cookies.
+ */
+object MangaCoilImageLoader {
+    @Volatile
+    private var instance: ImageLoader? = null
+
+    fun get(context: Context): ImageLoader {
+        return instance ?: synchronized(this) {
+            instance ?: buildImageLoader(context.applicationContext).also { instance = it }
+        }
+    }
+
+    private fun buildImageLoader(appContext: Context): ImageLoader {
+        val dispatcher = Dispatcher().apply {
+            maxRequests = 8
+            maxRequestsPerHost = 4
+        }
+        val okHttp = OkHttpClient.Builder()
+            .dispatcher(dispatcher)
+            .connectTimeout(20, TimeUnit.SECONDS)
+            .readTimeout(25, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .addInterceptor { chain ->
+                val original = chain.request()
+                val reqUrl = original.url.toString()
+                val referer = original.header("Referer").orEmpty()
+                val builder = original.newBuilder()
+                if (original.header("User-Agent").isNullOrBlank()) {
+                    builder.header("User-Agent", LiveMangaSiteScraper.activeUserAgent)
+                }
+                if (original.header("Accept").isNullOrBlank()) {
+                    builder.header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                }
+                if (original.header("Cookie").isNullOrBlank()) {
+                    val cookies = LiveMangaSiteScraper.getCombinedCookies(
+                        targetUrl = reqUrl,
+                        refererUrl = referer
+                    )
+                    if (cookies.isNotBlank()) {
+                        builder.header("Cookie", cookies)
+                    }
+                }
+                val response = chain.proceed(builder.build())
+                if (!response.isSuccessful) {
+                    DiagnosticLogger.logError(
+                        category = DiagnosticCategory.READER,
+                        message = "فشل جلب الصورة عبر الشبكة (HTTP ${response.code})",
+                        url = reqUrl,
+                        httpCode = response.code
+                    )
+                }
+                response
+            }
+            .build()
+
+        return ImageLoader.Builder(appContext)
+            .okHttpClient(okHttp)
+            .crossfade(true)
+            .respectCacheHeaders(false)
+            .build()
+    }
+}
 
 @Composable
 fun MangaPlaceholderCoverBox(
+    title: String = "",
     modifier: Modifier = Modifier
 ) {
-    // Neutral dark placeholder card matching 00:39-00:40 while real website covers load
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(8.dp))
-            .background(Color(0xFF222630)),
+            .background(Color(0xFF222630))
+            .padding(8.dp),
         contentAlignment = Alignment.Center
     ) {
-        Icon(
-            imageVector = Icons.Default.Image,
-            contentDescription = null,
-            tint = Color(0xFF4D5366),
-            modifier = Modifier.size(40.dp)
-        )
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Icon(
+                imageVector = Icons.Default.Image,
+                contentDescription = "غلاف المانجا",
+                tint = Color(0xFF5D657E),
+                modifier = Modifier.size(34.dp)
+            )
+            if (title.isNotBlank()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = title,
+                    color = Color(0xFF9EA6BE),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center
+                )
+            }
+        }
     }
 }
 
@@ -92,33 +187,52 @@ fun MangaCoverArtwork(
     showArabicTitleBanner: Boolean = false
 ) {
     val context = LocalContext.current
-    val localCover = work.localCoverPath.trim()
-    val hasLocalFile = remember(localCover) {
-        localCover.isNotBlank() && File(localCover).exists() && File(localCover).length() > 64L
+    val imageLoader = remember(context) { MangaCoilImageLoader.get(context) }
+
+    val resolvedLocalCover = remember(work.localCoverPath, work.sourceId, work.id) {
+        val direct = work.localCoverPath.trim()
+        if (direct.isNotBlank() && File(direct).exists() && File(direct).length() >= 64L) {
+            direct
+        } else {
+            // Check standard local cover location on disk as fallback
+            val extDir = try { context.getExternalFilesDir("saved") } catch (_: Throwable) { null }
+            val baseDir = extDir ?: File(context.filesDir, "saved")
+            val safeWork = work.id.replace(Regex("[^a-zA-Z0-9_\\-\u0600-\u06FF]"), "_").take(80).ifBlank { "item" }
+            val candidate = File(baseDir, "manga_offline/src_${work.sourceId}/$safeWork/cover.jpg")
+            if (candidate.exists() && candidate.length() >= 64L) candidate.absolutePath else ""
+        }
     }
-    val coverUrl = work.coverImageUrl?.trim().orEmpty()
+
+    val hasLocalFile = resolvedLocalCover.isNotBlank()
+    val coverUrl = work.effectiveCoverUrl?.trim().orEmpty()
 
     if (!hasLocalFile && coverUrl.isBlank()) {
-        MangaPlaceholderCoverBox(modifier = modifier)
+        MangaPlaceholderCoverBox(title = work.title, modifier = modifier)
         return
     }
 
-    val imageRequest = remember(hasLocalFile, localCover, coverUrl, work.siteUrl) {
+    val imageRequest = remember(hasLocalFile, resolvedLocalCover, coverUrl, work.siteUrl, work.mangaUrl) {
         if (hasLocalFile) {
             ImageRequest.Builder(context)
-                .data(File(localCover))
+                .data(File(resolvedLocalCover))
                 .crossfade(true)
                 .build()
         } else {
+            val effectiveReferer = work.mangaUrl.ifBlank { work.siteUrl }
             val builder = ImageRequest.Builder(context)
                 .data(coverUrl)
                 .crossfade(true)
+                .diskCachePolicy(CachePolicy.ENABLED)
                 .addHeader("User-Agent", LiveMangaSiteScraper.activeUserAgent)
 
-            if (work.siteUrl.isNotBlank()) {
-                builder.addHeader("Referer", work.siteUrl)
+            if (effectiveReferer.isNotBlank()) {
+                builder.addHeader("Referer", effectiveReferer)
             }
-            val cookie = LiveMangaSiteScraper.getCookiesForUrl(coverUrl)
+            val cookie = LiveMangaSiteScraper.getCombinedCookies(
+                targetUrl = coverUrl,
+                refererUrl = effectiveReferer,
+                siteUrl = work.siteUrl
+            )
             if (cookie.isNotBlank()) {
                 builder.addHeader("Cookie", cookie)
             }
@@ -128,14 +242,15 @@ fun MangaCoverArtwork(
 
     SubcomposeAsyncImage(
         model = imageRequest,
+        imageLoader = imageLoader,
         contentDescription = work.title,
         contentScale = ContentScale.Crop,
         modifier = modifier.clip(RoundedCornerShape(8.dp)),
         loading = {
-            MangaPlaceholderCoverBox(modifier = Modifier.fillMaxSize())
+            MangaPlaceholderCoverBox(title = work.title, modifier = Modifier.fillMaxSize())
         },
         error = {
-            MangaPlaceholderCoverBox(modifier = Modifier.fillMaxSize())
+            MangaPlaceholderCoverBox(title = work.title, modifier = Modifier.fillMaxSize())
         }
     )
 }
@@ -152,7 +267,10 @@ fun ChapterPageIllustration(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    var retryNonce by remember { mutableIntStateOf(0) }
+    val imageLoader = remember(context) { MangaCoilImageLoader.get(context) }
+    var retryNonce by remember(pageImageUrl, localFilePath) { mutableIntStateOf(0) }
+    var lastErrorReason by remember(pageImageUrl, localFilePath) { mutableStateOf("") }
+
     val cleanLocalPath = remember(localFilePath, pageImageUrl) {
         when {
             !localFilePath.isNullOrBlank() -> localFilePath.trim()
@@ -164,27 +282,41 @@ fun ChapterPageIllustration(
     val hasValidLocalFile = remember(cleanLocalPath, retryNonce) {
         cleanLocalPath.isNotBlank() && File(cleanLocalPath).exists() && File(cleanLocalPath).length() >= 64L
     }
-    val cleanUrl = pageImageUrl?.trim().orEmpty()
+    val cleanUrl = remember(pageImageUrl) {
+        val raw = pageImageUrl?.trim().orEmpty()
+        if (raw.startsWith("http://") || raw.startsWith("https://")) raw else ""
+    }
 
     if (!hasValidLocalFile && cleanUrl.isBlank()) {
         Box(
             modifier = modifier
                 .fillMaxWidth()
-                .height(340.dp)
-                .background(Color(0xFF0E1118)),
+                .height(300.dp)
+                .background(Color(0xFF0E1118))
+                .padding(16.dp),
             contentAlignment = Alignment.Center
         ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                CircularProgressIndicator(
-                    color = PeriwinklePrimary,
-                    strokeWidth = 2.5.dp,
-                    modifier = Modifier.size(32.dp)
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.BrokenImage,
+                    contentDescription = "صفحة غير متوفرة",
+                    tint = Color(0xFFE57373),
+                    modifier = Modifier.size(34.dp)
                 )
-                Spacer(modifier = Modifier.height(10.dp))
                 Text(
-                    text = "جاري جلب الصفحة ${pageIndex + 1}...",
+                    text = "الصفحة ${pageIndex + 1} من $totalPages غير محفوظة محليًا",
+                    color = TextPrimaryWhite,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = "يرجى الاتصال بالإنترنت واستكمال تنزيل الفصل لعرض هذه الصفحة",
                     color = TextSecondaryGrey,
-                    fontSize = 13.sp
+                    fontSize = 11.sp,
+                    textAlign = TextAlign.Center
                 )
             }
         }
@@ -193,24 +325,62 @@ fun ChapterPageIllustration(
 
     val imageRequest = remember(hasValidLocalFile, cleanLocalPath, cleanUrl, refererUrl, retryNonce) {
         if (hasValidLocalFile) {
-            // Read directly from local disk without any network request (100% offline capable)
+            // Read directly from local disk without any network request (100% offline capable in Airplane mode)
             ImageRequest.Builder(context)
                 .data(File(cleanLocalPath))
                 .crossfade(false)
                 .setParameter("retry_nonce", retryNonce)
+                .listener(
+                    onError = { _, result ->
+                        lastErrorReason = result.throwable.localizedMessage ?: "ملف الصورة المحلي تالف"
+                        DiagnosticLogger.logError(
+                            category = DiagnosticCategory.STORAGE,
+                            message = "فشل فك ترميز ملف الصفحة المحلية ${pageIndex + 1}: $lastErrorReason",
+                            workId = work.id,
+                            chapterId = "ch_$chapterNumber",
+                            pageNumber = pageIndex + 1,
+                            url = cleanLocalPath
+                        )
+                    }
+                )
                 .build()
         } else {
+            val effectiveReferer = refererUrl?.ifBlank { work.mangaUrl.ifBlank { work.siteUrl } }
+                ?: work.mangaUrl.ifBlank { work.siteUrl }
             val builder = ImageRequest.Builder(context)
                 .data(cleanUrl)
-                .crossfade(true)
+                .crossfade(false)
+                .diskCachePolicy(CachePolicy.ENABLED)
+                .memoryCachePolicy(
+                    if (retryNonce > 0) CachePolicy.WRITE_ONLY else CachePolicy.ENABLED
+                )
                 .addHeader("User-Agent", LiveMangaSiteScraper.activeUserAgent)
                 .setParameter("retry_nonce", retryNonce)
+                .listener(
+                    onError = { _, result ->
+                        val msg = result.throwable.localizedMessage ?: "خطأ في الاتصال أو الصورة غير مدعومة"
+                        lastErrorReason = msg
+                        DiagnosticLogger.logError(
+                            category = DiagnosticCategory.READER,
+                            message = "فشل عرض الصفحة ${pageIndex + 1}: $msg",
+                            sourceId = work.sourceId.toString(),
+                            sourceName = work.siteName,
+                            workId = work.id,
+                            chapterId = "ch_$chapterNumber",
+                            pageNumber = pageIndex + 1,
+                            url = cleanUrl
+                        )
+                    }
+                )
 
-            val effectiveReferer = refererUrl?.ifBlank { work.mangaUrl.ifBlank { work.siteUrl } } ?: work.siteUrl
             if (effectiveReferer.isNotBlank()) {
                 builder.addHeader("Referer", effectiveReferer)
             }
-            val cookie = LiveMangaSiteScraper.getCookiesForUrl(cleanUrl)
+            val cookie = LiveMangaSiteScraper.getCombinedCookies(
+                targetUrl = cleanUrl,
+                refererUrl = effectiveReferer,
+                siteUrl = work.siteUrl
+            )
             if (cookie.isNotBlank()) {
                 builder.addHeader("Cookie", cookie)
             }
@@ -220,15 +390,18 @@ fun ChapterPageIllustration(
 
     SubcomposeAsyncImage(
         model = imageRequest,
-        contentDescription = "صفحة ${pageIndex + 1}",
+        imageLoader = imageLoader,
+        contentDescription = "صفحة ${pageIndex + 1} من $totalPages",
         contentScale = ContentScale.FillWidth,
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier
+            .fillMaxWidth()
+            .testTag("reader_page_image_${pageIndex + 1}"),
         loading = {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(420.dp)
-                    .background(Color(0xFF0E1118)),
+                    .height(380.dp)
+                    .background(Color(0xFF0B0D13)),
                 contentAlignment = Alignment.Center
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -237,12 +410,12 @@ fun ChapterPageIllustration(
                         strokeWidth = 2.5.dp,
                         modifier = Modifier.size(32.dp)
                     )
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(10.dp))
                     Text(
-                        text = "${pageIndex + 1} / $totalPages",
+                        text = "جاري تحميل الصفحة ${pageIndex + 1} من $totalPages",
                         color = TextSecondaryGrey,
                         fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold
+                        fontWeight = FontWeight.SemiBold
                     )
                 }
             }
@@ -262,23 +435,33 @@ fun ChapterPageIllustration(
                 ) {
                     Icon(
                         imageVector = Icons.Default.BrokenImage,
-                        contentDescription = null,
-                        tint = TextSecondaryGrey,
-                        modifier = Modifier.size(36.dp)
+                        contentDescription = "فشل تحميل الصفحة",
+                        tint = Color(0xFFE57373),
+                        modifier = Modifier.size(34.dp)
                     )
                     Text(
-                        text = "تعذر تحميل صورة الصفحة ${pageIndex + 1}",
+                        text = "فشل تحميل الصفحة ${pageIndex + 1} من $totalPages",
                         color = TextPrimaryWhite,
                         fontSize = 13.sp,
-                        fontWeight = FontWeight.SemiBold
+                        fontWeight = FontWeight.Bold
                     )
+                    if (lastErrorReason.isNotBlank()) {
+                        Text(
+                            text = lastErrorReason.take(90),
+                            color = TextSecondaryGrey,
+                            fontSize = 11.sp,
+                            textAlign = TextAlign.Center,
+                            maxLines = 2
+                        )
+                    }
                     OutlinedButton(
                         onClick = { retryNonce++ },
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = PeriwinklePrimary)
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = PeriwinklePrimary),
+                        modifier = Modifier.testTag("retry_page_button_${pageIndex + 1}")
                     ) {
                         Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("إعادة المحاولة", fontSize = 12.sp)
+                        Text("إعادة محاولة الصفحة ${pageIndex + 1}", fontSize = 12.sp)
                     }
                 }
             }
@@ -288,7 +471,8 @@ fun ChapterPageIllustration(
 
 /**
  * Hidden 1x1 WebView DOM Bridge that loads a live manga site URL with full JS & CookieManager enabled,
- * executes the provided extraction script once the DOM settles, and passes the JSON result back to the screen.
+ * triggers scroll events for lazy-loaded images, executes the provided extraction script once the DOM settles,
+ * and passes the JSON result back to the screen.
  */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -336,6 +520,11 @@ fun HiddenSiteWebViewBridge(
                         override fun onPageFinished(view: WebView?, url: String?) {
                             super.onPageFinished(view, url)
                             CookieManager.getInstance().flush()
+                            // Trigger scroll events so lazy-load scripts populate data-src / src attributes
+                            view?.evaluateJavascript(
+                                "(function(){ try { window.scrollTo(0, 1200); window.scrollTo(0, document.body.scrollHeight); window.scrollTo(0, 0); } catch(e){} })();",
+                                null
+                            )
                             view?.postDelayed({
                                 try {
                                     view.evaluateJavascript(jsExtractorScript) { rawJson ->

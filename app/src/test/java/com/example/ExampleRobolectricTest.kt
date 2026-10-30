@@ -143,10 +143,22 @@ class ExampleRobolectricTest {
         val sampleChapterHtml = """
             <html>
             <body>
-                <div id="readerarea">
-                    <img data-src="https://olympustaff.com/uploads/chapters/ch1/01.jpg" />
-                    <img data-src="https://olympustaff.com/uploads/chapters/ch1/02.jpg" />
-                    <img data-src="https://olympustaff.com/uploads/chapters/ch1/03.jpg" />
+                <div class="reading-content">
+                    <div class="page-break no-gaps">
+                        <img id="image-0" data-src="https://olympustaff.com/uploads/chapters/ch1/01.jpg" class="wp-manga-chapter-img" />
+                    </div>
+                    <div class="page-break no-gaps">
+                        <img id="image-1" data-lazy-src="https://olympustaff.com/uploads/chapters/ch1/02.jpg" class="wp-manga-chapter-img" />
+                    </div>
+                    <div class="page-break no-gaps">
+                        <img id="image-2" data-original="https://olympustaff.com/uploads/chapters/ch1/03.jpg" class="wp-manga-chapter-img" />
+                    </div>
+                    <div class="page-break no-gaps">
+                        <img id="image-3" src="https://olympustaff.com/uploads/chapters/ch1/04.webp" class="wp-manga-chapter-img" />
+                    </div>
+                </div>
+                <div class="comments-area">
+                    <img src="https://olympustaff.com/uploads/avatars/user1.jpg" class="avatar" />
                 </div>
             </body>
             </html>
@@ -156,9 +168,11 @@ class ExampleRobolectricTest {
             html = sampleChapterHtml,
             chapterUrl = enrichedWork.chapters.first().chapterUrl
         )
-        assertEquals(3, pageUrls.size)
+        assertEquals(4, pageUrls.size)
         assertEquals("https://olympustaff.com/uploads/chapters/ch1/01.jpg", pageUrls[0])
         assertEquals("https://olympustaff.com/uploads/chapters/ch1/02.jpg", pageUrls[1])
+        assertEquals("https://olympustaff.com/uploads/chapters/ch1/03.jpg", pageUrls[2])
+        assertEquals("https://olympustaff.com/uploads/chapters/ch1/04.webp", pageUrls[3])
     }
 
     @Test

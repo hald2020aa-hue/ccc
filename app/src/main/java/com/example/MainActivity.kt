@@ -1,10 +1,16 @@
 package com.example
 
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -13,16 +19,21 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.MangaCatalogData
 import com.example.data.MangaChapter
 import com.example.data.MangaWork
+import com.example.data.download.DownloadNotificationHelper
 import com.example.ui.components.AddSiteFlowDialog
 import com.example.ui.components.AppNavigationDrawerContent
 import com.example.ui.components.BottomToastAndNoticeOverlay
@@ -55,8 +66,11 @@ import com.example.ui.viewmodel.MainViewModel
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
+    private var pendingNotificationIntent by mutableStateOf<Intent?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pendingNotificationIntent = intent
         enableEdgeToEdge()
         setContent {
             val context = LocalContext.current
@@ -65,6 +79,34 @@ class MainActivity : ComponentActivity() {
             )
             val userSettings by mainViewModel.settings.collectAsStateWithLifecycle()
 
+            val notificationPermissionLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.RequestPermission()
+            ) { _ -> }
+
+            LaunchedEffect(Unit) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    val granted = ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.POST_NOTIFICATIONS
+                    ) == PackageManager.PERMISSION_GRANTED
+                    if (!granted) {
+                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                }
+            }
+
+            LaunchedEffect(pendingNotificationIntent) {
+                val currentIntent = pendingNotificationIntent ?: return@LaunchedEffect
+                val openWorkId = currentIntent.getStringExtra(DownloadNotificationHelper.EXTRA_OPEN_WORK_ID)
+                val openChapterNum = currentIntent.getIntExtra(DownloadNotificationHelper.EXTRA_OPEN_CHAPTER_NUMBER, -1)
+                if (!openWorkId.isNullOrBlank() && openChapterNum > 0) {
+                    mainViewModel.openChapterFromNotification(openWorkId, openChapterNum)
+                    currentIntent.removeExtra(DownloadNotificationHelper.EXTRA_OPEN_WORK_ID)
+                    currentIntent.removeExtra(DownloadNotificationHelper.EXTRA_OPEN_CHAPTER_NUMBER)
+                }
+                pendingNotificationIntent = null
+            }
+
             MyApplicationTheme(
                 appThemeKey = userSettings.appTheme,
                 pureDarkMode = userSettings.pureDarkMode
@@ -72,6 +114,12 @@ class MainActivity : ComponentActivity() {
                 MangaSitesReaderApp(viewModel = mainViewModel)
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        pendingNotificationIntent = intent
     }
 }
 
@@ -102,6 +150,8 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
     val selectedWork by viewModel.selectedWork.collectAsStateWithLifecycle()
     val selectedChapter by viewModel.selectedChapter.collectAsStateWithLifecycle()
     val downloadedChaptersMap by viewModel.downloadedChaptersMap.collectAsStateWithLifecycle()
+    val chapterDownloadStatesMap by viewModel.chapterDownloadStatesMap.collectAsStateWithLifecycle()
+    val diagnosticLogs by viewModel.diagnosticLogs.collectAsStateWithLifecycle()
     val readChaptersMap by viewModel.readChaptersMap.collectAsStateWithLifecycle()
     val readingProgressMap by viewModel.readingProgressMap.collectAsStateWithLifecycle()
 
@@ -178,6 +228,9 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         onOpenDownloadedWork = { entity ->
                             viewModel.openDownloadedWorkFromStorage(entity)
                         },
+                        onDeleteDownloadedWork = { workId ->
+                            viewModel.deleteDownloadedWorkFromStorage(workId)
+                        },
                         onDeleteWork = { work -> viewModel.deleteSavedWork(work) },
                         onContinueReadingClick = {
                             viewModel.resumeReadingCurrentOrLastWork()
@@ -222,6 +275,7 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                             it.url.contains(selectedWork.id, ignoreCase = true)
                     }
                     val downloadedChaptersForWork = downloadedChaptersMap[selectedWork.id] ?: emptySet()
+                    val chapterStatesForWork = chapterDownloadStatesMap[selectedWork.id] ?: emptyMap()
                     val readChaptersForWork = readChaptersMap[selectedWork.id] ?: emptySet()
                     val resumeLabel = viewModel.getFormattedResumeLabel(selectedWork.id)
 
@@ -229,6 +283,7 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         work = selectedWork,
                         isFavorite = isWorkFav,
                         downloadedChapterNumbers = downloadedChaptersForWork,
+                        chapterDownloadStates = chapterStatesForWork,
                         readChapterNumbers = readChaptersForWork,
                         resumeLabel = resumeLabel,
                         addedSites = enabledSites,
@@ -275,6 +330,7 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         ?.second
                         ?: selectedChapter.lastReadPage.takeIf { it >= 0 }
                         ?: 0
+                    val liveChapterDownloadState = chapterDownloadStatesMap[selectedWork.id]?.get(selectedChapter.number)
 
                     MangaChapterReaderScreen(
                         work = selectedWork,
@@ -282,6 +338,9 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         settings = settings,
                         isFavorite = isWorkFav,
                         initialPageIndex = savedPageIndex,
+                        liveChapterDownloadState = liveChapterDownloadState,
+                        diagnosticLogs = diagnosticLogs,
+                        onClearDiagnosticLogs = { viewModel.clearDiagnosticLogs() },
                         onSaveReadingProgress = { pageIdx ->
                             viewModel.saveReadingProgress(selectedWork, selectedChapter, pageIdx)
                         },
@@ -300,7 +359,7 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                             viewModel.downloadChaptersForWork(
                                 work = work,
                                 chapters = listOf(chapter),
-                                toastMsg = "بدأ التنزيل 😭"
+                                toastMsg = "بدأ تنزيل الفصل ${chapter.number}..."
                             )
                         },
                         onUpdateWebtoonMode = { enabled ->

@@ -53,10 +53,37 @@ object LiveMangaSiteScraper {
     fun getCookiesForUrl(url: String): String {
         if (url.isBlank()) return ""
         return try {
-            CookieManager.getInstance().getCookie(url) ?: ""
-        } catch (_: Exception) {
+            CookieManager.getInstance()?.getCookie(url) ?: ""
+        } catch (_: Throwable) {
             ""
         }
+    }
+
+    /**
+     * يدمج ملفات تعريف الارتباط (Cookies) من رابط الصورة (CDN) ورابط الصفحة المرجعية (Referer) ورابط الموقع الأصلي
+     * لضمان نجاح تحميل الصور التي تتطلب جلسة Cloudflare أو جلسة موقع نشطة.
+     */
+    fun getCombinedCookies(
+        targetUrl: String,
+        refererUrl: String? = null,
+        siteUrl: String? = null
+    ): String {
+        val cookiePairs = LinkedHashMap<String, String>()
+        listOfNotNull(siteUrl, refererUrl, targetUrl).forEach { url ->
+            val rawCookie = getCookiesForUrl(url)
+            if (rawCookie.isNotBlank()) {
+                rawCookie.split(";").forEach { segment ->
+                    val trimmed = segment.trim()
+                    if (trimmed.isNotBlank()) {
+                        val key = trimmed.substringBefore("=").trim()
+                        if (key.isNotBlank()) {
+                            cookiePairs[key] = trimmed
+                        }
+                    }
+                }
+            }
+        }
+        return cookiePairs.values.joinToString("; ")
     }
 
     fun buildRequest(url: String, referer: String? = null, postFormBody: String? = null): Request {
@@ -68,7 +95,7 @@ object LiveMangaSiteScraper {
         if (!referer.isNullOrBlank()) {
             builder.header("Referer", referer)
         }
-        val cookie = getCookiesForUrl(url)
+        val cookie = getCombinedCookies(targetUrl = url, refererUrl = referer)
         if (cookie.isNotBlank()) {
             builder.header("Cookie", cookie)
         }
@@ -105,24 +132,25 @@ object LiveMangaSiteScraper {
             return ""
         }
         if (cleaned.startsWith("http://") || cleaned.startsWith("https://")) {
-            return cleaned
+            return cleaned.replace(" ", "%20")
         }
         if (cleaned.startsWith("//")) {
-            return "https:$cleaned"
+            return "https:${cleaned.replace(" ", "%20")}"
         }
         return try {
             val baseUri = URI(baseUrl.trimEnd('/'))
             val scheme = baseUri.scheme ?: "https"
-            val host = baseUri.host ?: return cleaned
+            val host = baseUri.host ?: return cleaned.replace(" ", "%20")
             val portPart = if (baseUri.port != -1 && baseUri.port != 80 && baseUri.port != 443) ":${baseUri.port}" else ""
             val origin = "$scheme://$host$portPart"
-            if (cleaned.startsWith("/")) {
-                "$origin$cleaned"
+            val normPath = cleaned.replace(" ", "%20")
+            if (normPath.startsWith("/")) {
+                "$origin$normPath"
             } else {
-                "$origin/$cleaned"
+                "$origin/$normPath"
             }
         } catch (_: Exception) {
-            cleaned
+            cleaned.replace(" ", "%20")
         }
     }
 
@@ -515,21 +543,69 @@ object LiveMangaSiteScraper {
         try {
             val request = buildRequest(targetUrl, referer = work.mangaUrl.ifBlank { work.siteUrl })
             httpClient.newCall(request).execute().use { response ->
+                val httpCode = response.code
                 val html = response.body?.string() ?: ""
-                if (isCloudflareChallengeHtml(html, response.code)) {
+                if (isCloudflareChallengeHtml(html, httpCode)) {
+                    DiagnosticLogger.logWarn(
+                        category = DiagnosticCategory.SCRAPER,
+                        message = "صفحة الفصل تتطلب تخطي حماية Cloudflare",
+                        sourceId = work.sourceId.toString(),
+                        sourceName = work.siteName,
+                        workId = work.id,
+                        chapterId = chapter.id,
+                        url = targetUrl,
+                        httpCode = httpCode
+                    )
                     return@withContext ChapterPagesScrapeResult(
                         pageUrls = emptyList(),
                         requiresCloudflare = true,
                         errorMessage = "يتطلب الفصل تخطي حماية Cloudflare"
                     )
                 }
+                if (!response.isSuccessful && html.isBlank()) {
+                    DiagnosticLogger.logError(
+                        category = DiagnosticCategory.SCRAPER,
+                        message = "فشل جلب صفحة الفصل (HTTP $httpCode)",
+                        sourceId = work.sourceId.toString(),
+                        sourceName = work.siteName,
+                        workId = work.id,
+                        chapterId = chapter.id,
+                        url = targetUrl,
+                        httpCode = httpCode
+                    )
+                    return@withContext ChapterPagesScrapeResult(
+                        pageUrls = emptyList(),
+                        requiresCloudflare = false,
+                        errorMessage = "فشل الاتصال بصفحة الفصل (HTTP $httpCode)"
+                    )
+                }
                 val pages = parseChapterPagesHtml(html, targetUrl)
+                DiagnosticLogger.logInfo(
+                    category = DiagnosticCategory.SCRAPER,
+                    message = "تم استخراج ${pages.size} صفحة للفصل ${chapter.number} من HTML",
+                    sourceId = work.sourceId.toString(),
+                    sourceName = work.siteName,
+                    workId = work.id,
+                    chapterId = chapter.id,
+                    url = targetUrl,
+                    httpCode = httpCode
+                )
                 ChapterPagesScrapeResult(
                     pageUrls = pages,
-                    requiresCloudflare = false
+                    requiresCloudflare = false,
+                    errorMessage = if (pages.isEmpty()) "لم يتم العثور على صور داخل صفحة الفصل" else null
                 )
             }
         } catch (e: Exception) {
+            DiagnosticLogger.logError(
+                category = DiagnosticCategory.SCRAPER,
+                message = "استثناء أثناء جلب صفحات الفصل: ${e.localizedMessage}",
+                sourceId = work.sourceId.toString(),
+                sourceName = work.siteName,
+                workId = work.id,
+                chapterId = chapter.id,
+                url = targetUrl
+            )
             ChapterPagesScrapeResult(
                 pageUrls = emptyList(),
                 requiresCloudflare = false,
@@ -538,47 +614,95 @@ object LiveMangaSiteScraper {
         }
     }
 
+    /**
+     * يستخرج جميع روابط صور الفصل بالترتيب الأصلي مع إزالة الروابط المكررة،
+     * ويعالج حاويات القراءة المتداخلة (.reading-content / .page-break / #readerarea)
+     * ومصفوفات JSON داخل السكربتات دون التوقف عند الصورة الأولى.
+     */
     fun parseChapterPagesHtml(html: String, chapterUrl: String): List<String> {
         if (html.isBlank()) return emptyList()
         val images = LinkedHashSet<String>()
 
-        // 1. Check ts_reader.run({... "images": [...] }) or chapter_preloaded_images JSON arrays
-        val jsonArrayRegex = Regex("""["']images["']\s*:\s*\[([^\]]+)\]""", RegexOption.IGNORE_CASE)
-        jsonArrayRegex.findAll(html).forEach { match ->
-            val arrayContent = match.groupValues[1]
-            Regex("""["'](https?:[^"']+)["']""", RegexOption.IGNORE_CASE).findAll(arrayContent).forEach { urlMatch ->
-                val cleanUrl = urlMatch.groupValues[1].replace("\\/", "/").trim()
-                if (!isIgnoredAssetImage(cleanUrl)) {
-                    images.add(cleanUrl)
-                }
+        // 1. Check ts_reader.run({... "images": [...] }), chapter_preloaded_images, or JSON arrays of page URLs
+        val jsonArrayPatterns = listOf(
+            Regex("""["'](?:images|pages|page_urls|chapter_images)["']\s*:\s*\[([\s\S]*?)\]""", RegexOption.IGNORE_CASE),
+            Regex("""(?:chapter_preloaded_images|chapterImages|pagesList|image_list)\s*=\s*\[([\s\S]*?)\]""", RegexOption.IGNORE_CASE)
+        )
+        for (pattern in jsonArrayPatterns) {
+            pattern.findAll(html).forEach { match ->
+                val arrayContent = match.groupValues[1]
+                Regex("""["']((?:https?:)?//[^"']+|/[^"']+\.(?:jpg|jpeg|png|webp)(?:\?[^"']*)?)["']""", RegexOption.IGNORE_CASE)
+                    .findAll(arrayContent)
+                    .forEach { urlMatch ->
+                        val rawUrl = urlMatch.groupValues[1].replace("\\/", "/").trim()
+                        val resolved = resolveUrl(chapterUrl, rawUrl)
+                        if (resolved.isNotBlank() && !isIgnoredAssetImage(resolved) && isLikelyChapterPageImage(resolved)) {
+                            images.add(resolved)
+                        }
+                    }
             }
         }
 
-        // 2. Check reader container blocks (.reading-content, #readerarea, .page-break, .chapter-content, #images_chapter)
-        val readerBlockRegex = Regex(
-            """<(?:div|section|main)[^>]+(?:id|class)=["'][^"']*(?:reading-content|readerarea|page-break|chapter-content|images_chapter|vung-doc|container-chapter-reader|text-left)[^"']*["'][^>]*>([\s\S]*?)</(?:div|section|main)>""",
+        // 2. Slice HTML from the reader container start up to comments/footer/related sections
+        // (Avoids the non-greedy </div> bug where nested <div class="page-break"> stopped after page 1!)
+        val readerStartRegex = Regex(
+            """<(?:div|section|main|article)[^>]+(?:id|class)=["'][^"']*(?:reading-content|readerarea|chapter-content|images_chapter|vung-doc|container-chapter-reader|rdminimal|chapter-reader|reader-area|entry-content)[^"']*["'][^>]*>""",
             RegexOption.IGNORE_CASE
         )
-        readerBlockRegex.findAll(html).forEach { blockMatch ->
-            extractAllImageUrlsFromFragment(blockMatch.groupValues[1], chapterUrl).forEach { url ->
-                if (!isIgnoredAssetImage(url)) {
+        val readerStartMatch = readerStartRegex.find(html)
+        if (readerStartMatch != null) {
+            val startIndex = readerStartMatch.range.first
+            val tailHtml = html.substring(startIndex)
+            val footerBoundaryRegex = Regex(
+                """<(?:div|section|footer|aside)[^>]+(?:id|class)=["'][^"']*(?:comments-area|disqus_thread|c-blog__heading|related-manga|manga-discussion|wp-manga-nav|site-footer|footer-area)[^"']*["']""",
+                RegexOption.IGNORE_CASE
+            )
+            val endOffset = footerBoundaryRegex.find(tailHtml)?.range?.first ?: minOf(tailHtml.length, 350_000)
+            val readerSectionHtml = tailHtml.substring(0, endOffset)
+            extractAllImageUrlsFromFragment(readerSectionHtml, chapterUrl).forEach { url ->
+                if (!isIgnoredAssetImage(url) && isLikelyChapterPageImage(url)) {
                     images.add(url)
                 }
             }
         }
 
-        // 3. Scan all <img> tags with wp-manga-chapter-img or chapter image attributes
+        // 3. Scan all .page-break blocks or explicit reader <img> tags across the entire document
+        val pageBreakRegex = Regex(
+            """<div[^>]+class=["'][^"']*(?:page-break|image-item|chapter-image|page-item)[^"']*["'][^>]*>([\s\S]*?)</div>""",
+            RegexOption.IGNORE_CASE
+        )
+        pageBreakRegex.findAll(html).forEach { match ->
+            extractAllImageUrlsFromFragment(match.groupValues[1], chapterUrl).forEach { url ->
+                if (!isIgnoredAssetImage(url) && isLikelyChapterPageImage(url)) {
+                    images.add(url)
+                }
+            }
+        }
+
         val imgTagRegex = Regex("""<img[^>]+>""", RegexOption.IGNORE_CASE)
         imgTagRegex.findAll(html).forEach { match ->
             val tag = match.value
-            val isReaderImg = tag.contains("wp-manga-chapter-img", ignoreCase = true) ||
+            val isExplicitReaderImg = tag.contains("wp-manga-chapter-img", ignoreCase = true) ||
                 tag.contains("chapter-img", ignoreCase = true) ||
                 tag.contains("page-img", ignoreCase = true) ||
                 tag.contains("ts-main-image", ignoreCase = true) ||
-                images.isEmpty()
+                tag.contains("data-page", ignoreCase = true) ||
+                tag.contains("data-index", ignoreCase = true) ||
+                tag.contains("image-", ignoreCase = true)
 
-            if (isReaderImg) {
+            if (isExplicitReaderImg) {
                 val url = extractBestImageUrl(tag, chapterUrl)
+                if (url.isNotBlank() && !isIgnoredAssetImage(url) && isLikelyChapterPageImage(url)) {
+                    images.add(url)
+                }
+            }
+        }
+
+        // 4. Fallback: If fewer than 2 images were found above, scan ALL <img> tags on the page
+        // (Never use `images.isEmpty()` inside the loop condition, which previously caused stopping after 1 image!)
+        if (images.size < 2) {
+            imgTagRegex.findAll(html).forEach { match ->
+                val url = extractBestImageUrl(match.value, chapterUrl)
                 if (url.isNotBlank() && !isIgnoredAssetImage(url) && isLikelyChapterPageImage(url)) {
                     images.add(url)
                 }
@@ -728,26 +852,59 @@ object LiveMangaSiteScraper {
                        !!document.querySelector("#cf-wrapper, .cf-browser-verification, iframe[src*='challenges.cloudflare.com']");
             var urls = [];
             var seen = {};
-            var selectors = [
+            function addUrl(raw) {
+                if (!raw || typeof raw !== "string") return;
+                var u = raw.trim();
+                if (!u || u.indexOf("data:image") === 0 || u.indexOf("javascript:") === 0) return;
+                var lower = u.toLowerCase();
+                if (lower.indexOf("logo") !== -1 || lower.indexOf("avatar") !== -1 ||
+                    lower.indexOf("favicon") !== -1 || lower.indexOf("gravatar") !== -1 ||
+                    lower.indexOf("spinner") !== -1 || lower.indexOf("loading") !== -1 ||
+                    lower.indexOf(".svg") !== -1) return;
+                if (!seen[u]) {
+                    seen[u] = true;
+                    urls.push(u);
+                }
+            }
+            try {
+                if (window.chapter_preloaded_images && Array.isArray(window.chapter_preloaded_images)) {
+                    for (var p = 0; p < window.chapter_preloaded_images.length; p++) {
+                        addUrl(window.chapter_preloaded_images[p]);
+                    }
+                }
+                if (window.chapterImages && Array.isArray(window.chapterImages)) {
+                    for (var c = 0; c < window.chapterImages.length; c++) {
+                        addUrl(window.chapterImages[c]);
+                    }
+                }
+            } catch (e) {}
+            var readerSelectors = [
                 ".reading-content img", "#readerarea img", ".page-break img",
                 ".chapter-content img", "#images_chapter img", "img.wp-manga-chapter-img",
-                ".vung-doc img", ".container-chapter-reader img", "main img", "article img"
+                ".vung-doc img", ".container-chapter-reader img", ".rdminimal img",
+                ".chapter-reader img", ".entry-content img"
             ];
-            var imgs = document.querySelectorAll(selectors.join(","));
-            if (imgs.length < 2) {
-                imgs = document.querySelectorAll("img");
+            var readerImgs = document.querySelectorAll(readerSelectors.join(","));
+            for (var i = 0; i < readerImgs.length; i++) {
+                var im = readerImgs[i];
+                var src = im.getAttribute("data-src") || im.getAttribute("data-lazy-src") ||
+                          im.getAttribute("data-original") || im.getAttribute("data-url") ||
+                          im.getAttribute("data-cfsrc") || im.getAttribute("data-pagespeed-lazy-src") ||
+                          im.currentSrc || im.src || "";
+                addUrl(src);
             }
-            for (var i = 0; i < imgs.length; i++) {
-                var im = imgs[i];
-                var src = (im.getAttribute("data-src") || im.getAttribute("data-lazy-src") ||
-                           im.getAttribute("data-original") || im.currentSrc || im.src || "").trim();
-                if (!src || src.indexOf("data:image") === 0) continue;
-                var lower = src.toLowerCase();
-                if (lower.indexOf("logo") !== -1 || lower.indexOf("avatar") !== -1 || lower.indexOf("icon") !== -1 || lower.indexOf("gravatar") !== -1) continue;
-                var w = im.naturalWidth || im.width || 400;
-                if (w >= 180 && !seen[src]) {
-                    seen[src] = true;
-                    urls.push(src);
+            if (urls.length < 2) {
+                var allImgs = document.querySelectorAll("main img, article img, img");
+                for (var j = 0; j < allImgs.length; j++) {
+                    var im2 = allImgs[j];
+                    var src2 = im2.getAttribute("data-src") || im2.getAttribute("data-lazy-src") ||
+                               im2.getAttribute("data-original") || im2.getAttribute("data-url") ||
+                               im2.currentSrc || im2.src || "";
+                    var hasLazyAttr = !!(im2.getAttribute("data-src") || im2.getAttribute("data-lazy-src") || im2.getAttribute("data-original"));
+                    var w = im2.naturalWidth || im2.width || (hasLazyAttr ? 400 : 250);
+                    if (w >= 160) {
+                        addUrl(src2);
+                    }
                 }
             }
             return JSON.stringify({ cf: isCf, pages: urls });
@@ -888,21 +1045,36 @@ object LiveMangaSiteScraper {
     // ==================== HELPER UTILITIES ====================
 
     private fun extractBestImageUrl(fragment: String, baseUrl: String): String {
-        val attrPriority = listOf(
+        val singleUrlAttributes = listOf(
             "data-src",
             "data-lazy-src",
             "data-original",
+            "data-url",
             "data-cfsrc",
-            "srcset",
-            "src"
+            "data-pagespeed-lazy-src",
+            "data-echo",
+            "data-full-url"
         )
-        for (attr in attrPriority) {
-            val raw = extractAttribute(fragment, attr)
-            if (raw.isNotBlank() && !raw.startsWith("data:image")) {
+        for (attr in singleUrlAttributes) {
+            val raw = extractAttribute(fragment, attr).trim()
+            if (raw.isNotBlank() && !raw.startsWith("data:image", ignoreCase = true)) {
+                val resolved = resolveUrl(baseUrl, raw)
+                if (resolved.isNotBlank()) return resolved
+            }
+        }
+        val srcsetAttributes = listOf("data-srcset", "srcset")
+        for (attr in srcsetAttributes) {
+            val raw = extractAttribute(fragment, attr).trim()
+            if (raw.isNotBlank() && !raw.startsWith("data:image", ignoreCase = true)) {
                 val firstCandidate = raw.substringBefore(",").trim().substringBefore(" ")
                 val resolved = resolveUrl(baseUrl, firstCandidate)
                 if (resolved.isNotBlank()) return resolved
             }
+        }
+        val rawSrc = extractAttribute(fragment, "src").trim()
+        if (rawSrc.isNotBlank() && !rawSrc.startsWith("data:image", ignoreCase = true)) {
+            val resolved = resolveUrl(baseUrl, rawSrc)
+            if (resolved.isNotBlank()) return resolved
         }
         // Check inline style background-image
         val bgRegex = Regex("""background-image\s*:\s*url\(([^)]+)\)""", RegexOption.IGNORE_CASE)

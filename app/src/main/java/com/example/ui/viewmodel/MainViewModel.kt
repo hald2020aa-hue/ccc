@@ -5,6 +5,8 @@ import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.example.data.DiagnosticLogEntry
+import com.example.data.DiagnosticLogger
 import com.example.data.MangaCatalogData
 import com.example.data.MangaChapter
 import com.example.data.MangaWork
@@ -138,6 +140,12 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
     private val _downloadedChaptersMap = MutableStateFlow<Map<String, Set<Int>>>(emptyMap())
     val downloadedChaptersMap: StateFlow<Map<String, Set<Int>>> = _downloadedChaptersMap.asStateFlow()
 
+    // Maps workId -> (chapterNumber -> DownloadedChapterEntity) for live per-chapter progress/status
+    private val _chapterDownloadStatesMap = MutableStateFlow<Map<String, Map<Int, DownloadedChapterEntity>>>(emptyMap())
+    val chapterDownloadStatesMap: StateFlow<Map<String, Map<Int, DownloadedChapterEntity>>> = _chapterDownloadStatesMap.asStateFlow()
+
+    val diagnosticLogs: StateFlow<List<DiagnosticLogEntry>> = DiagnosticLogger.logs
+
     private val _readChaptersMap = MutableStateFlow<Map<String, Set<Int>>>(emptyMap())
     val readChaptersMap: StateFlow<Map<String, Set<Int>>> = _readChaptersMap.asStateFlow()
 
@@ -174,11 +182,22 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
         // Sync downloadedChapters and readingProgress from Room into UI maps
         viewModelScope.launch {
             repository.allDownloadedChapters.collect { chList ->
-                val grouped = chList
-                    .filter { it.status == "COMPLETED" }
+                val stateByWork = chList
+                    .groupBy { it.workId }
+                    .mapValues { (_, list) -> list.associateBy { it.chapterNumber } }
+                _chapterDownloadStatesMap.value = stateByWork
+
+                val verifiedCompleted = chList
+                    .filter { ch ->
+                        ch.status == "COMPLETED" &&
+                            repository.localStorageManager.verifyChapterFilesComplete(
+                                ch.pageCount,
+                                repository.localStorageManager.decodeLocalPathsJson(ch.localPagesJson)
+                            )
+                    }
                     .groupBy { it.workId }
                     .mapValues { (_, list) -> list.map { it.chapterNumber }.toSet() }
-                _downloadedChaptersMap.value = grouped
+                _downloadedChaptersMap.value = verifiedCompleted
             }
         }
         viewModelScope.launch {
@@ -359,22 +378,39 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
     fun openMangaChapterReader(work: MangaWork, chapter: MangaChapter) {
         viewModelScope.launch {
             // Check if this chapter has locally downloaded files on disk
-            val chapterKey = "${work.id}_ch_${chapter.number}"
+            val chapterKey = chapter.chapterKey.ifBlank { "${work.id}_ch_${chapter.number}" }
             val localChEntity = repository.dao.getDownloadedChapterByKey(chapterKey)
+                ?: repository.dao.getDownloadedChaptersForWorkOnce(work.id).find { it.chapterNumber == chapter.number }
+            val savedProgress = repository.readingProgressRepository.getChapterProgress(work.id, chapter.number)
+            val effectiveLastPage = savedProgress?.lastPageIndex ?: chapter.lastReadPage
+
             val effectiveChapter = if (localChEntity != null) {
-                val paths = repository.localStorageManager.decodeLocalPathsJson(localChEntity.localPagePathsJson)
-                val savedProgress = repository.readingProgressRepository.getChapterProgress(work.id, chapter.number)
+                val rawPaths = repository.localStorageManager.decodeLocalPathsJson(localChEntity.localPagePathsJson)
+                val validPaths = repository.localStorageManager.filterExistingValidPagePaths(rawPaths)
+                val expectedPages = localChEntity.totalPages.coerceAtLeast(rawPaths.size).coerceAtLeast(chapter.pageCount).coerceAtLeast(1)
+                val isTrulyComplete = localChEntity.status == "COMPLETED" &&
+                    repository.localStorageManager.verifyChapterFilesComplete(expectedPages, validPaths)
+                val effectiveStatus = when {
+                    isTrulyComplete -> "COMPLETED"
+                    localChEntity.status == "COMPLETED" && validPaths.isNotEmpty() -> "INCOMPLETE"
+                    localChEntity.status == "COMPLETED" -> "FAILED"
+                    else -> localChEntity.status
+                }
                 chapter.copy(
-                    localPagePaths = paths,
-                    downloadStatus = localChEntity.status,
-                    pageCount = localChEntity.totalPages.coerceAtLeast(paths.size).coerceAtLeast(chapter.pageCount),
-                    lastReadPage = savedProgress?.lastPageIndex ?: chapter.lastReadPage,
-                    chapterKey = chapterKey
+                    localPagePaths = validPaths,
+                    downloadedPagesCount = validPaths.size,
+                    isDownloaded = isTrulyComplete,
+                    downloadStatus = effectiveStatus,
+                    downloadError = localChEntity.errorMessage.orEmpty(),
+                    pageCount = expectedPages,
+                    isRead = true,
+                    lastReadPage = effectiveLastPage,
+                    chapterKey = localChEntity.chapterKey.ifBlank { chapterKey }
                 )
             } else {
-                val savedProgress = repository.readingProgressRepository.getChapterProgress(work.id, chapter.number)
                 chapter.copy(
-                    lastReadPage = savedProgress?.lastPageIndex ?: chapter.lastReadPage,
+                    isRead = true,
+                    lastReadPage = effectiveLastPage,
                     chapterKey = chapterKey
                 )
             }
@@ -388,7 +424,7 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
             currentReadMap[work.id] = readSet
             _readChaptersMap.value = currentReadMap
 
-            val resumePage = effectiveChapter.lastReadPage.coerceAtLeast(0)
+            val resumePage = effectiveChapter.lastReadPage.takeIf { it >= 0 } ?: 0
             val currentProgressMap = _readingProgressMap.value.toMutableMap()
             currentProgressMap[work.id] = effectiveChapter.number to resumePage
             _readingProgressMap.value = currentProgressMap
@@ -410,6 +446,21 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
                 siteName = work.siteName
             )
             navigateTo(AppScreen.MANGA_READER)
+        }
+    }
+
+    fun openChapterFromNotification(workId: String, chapterNumber: Int) {
+        if (workId.isBlank()) return
+        viewModelScope.launch {
+            val entity = repository.dao.getDownloadedWorkById(workId) ?: return@launch
+            val offlineWork = repository.buildOfflineMangaWorkFromEntity(entity)
+            val targetCh = offlineWork.chapters.find { it.number == chapterNumber }
+                ?: offlineWork.chapters.firstOrNull()
+            if (targetCh != null) {
+                openMangaChapterReader(offlineWork, targetCh)
+            } else {
+                openMangaDetails(offlineWork)
+            }
         }
     }
 
@@ -485,21 +536,35 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
                 showToast("التنزيل عبر شبكة Wi-Fi فقط مفعّل في الإعدادات")
                 return@launch
             }
-            val currentMap = _downloadedChaptersMap.value.toMutableMap()
-            val existingSet = currentMap[work.id]?.toMutableSet() ?: mutableSetOf()
-            chapters.forEach { existingSet.add(it.number) }
-            currentMap[work.id] = existingSet
-            _downloadedChaptersMap.value = currentMap
+            if (!repository.isNetworkAvailable() && chapters.all { !it.chapterUrl.startsWith("offline://") && !it.chapterUrl.startsWith("test://") }) {
+                showToast("لا يوجد اتصال بالإنترنت لتنزيل الفصول حاليًا")
+                return@launch
+            }
 
             showToast(toastMsg)
+            val matchingSite = sites.value.find { it.id == work.sourceId || it.url == work.siteUrl }
             repository.mangaDownloadManager.enqueueChaptersDownload(
                 work = work,
                 chapters = chapters,
+                site = matchingSite,
                 quality = quality
             )
             delay(500)
             refreshStorageStats()
         }
+    }
+
+    fun retryOrResumeChapterDownload(work: MangaWork, chapter: MangaChapter) {
+        downloadChaptersForWork(
+            work = work,
+            chapters = listOf(chapter),
+            toastMsg = "جارٍ استكمال تنزيل ${chapter.title}..."
+        )
+    }
+
+    fun clearDiagnosticLogs() {
+        DiagnosticLogger.clearLogs()
+        showToast("تم مسح سجل التشخيص")
     }
 
     fun saveWholeMangaFromCatalog(work: MangaWork) {

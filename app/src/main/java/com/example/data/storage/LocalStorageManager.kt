@@ -2,6 +2,7 @@ package com.example.data.storage
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -19,7 +20,11 @@ import java.io.File
 class LocalStorageManager(private val context: Context) {
 
     fun getRootSavedDir(): File {
-        val extDir = context.getExternalFilesDir("saved")
+        val extDir = try {
+            context.getExternalFilesDir("saved")
+        } catch (_: Throwable) {
+            null
+        }
         val baseDir = extDir ?: File(context.filesDir, "saved")
         if (!baseDir.exists()) baseDir.mkdirs()
         return baseDir
@@ -48,19 +53,58 @@ class LocalStorageManager(private val context: Context) {
     fun getChapterDirectory(workId: String, chapterKey: String): File =
         getChapterDir(0L, workId, chapterKey)
 
-    fun saveCoverImage(sourceId: Long, workId: String, bytes: ByteArray): File {
+    fun hasValidLocalCover(path: String): Boolean {
+        if (path.isBlank()) return false
+        val f = File(path)
+        return isValidImageFile(f)
+    }
+
+    fun getExistingValidCoverFile(sourceId: Long, workId: String): File? {
+        val workDir = getWorkDir(sourceId, workId)
+        val candidates = listOf("cover.jpg", "cover.webp", "cover.png", "cover.jpeg")
+        for (name in candidates) {
+            val f = File(workDir, name)
+            if (isValidImageFile(f)) return f
+        }
+        return null
+    }
+
+    /**
+     * Checks if a valid downloaded image already exists for a given page index (0-based)
+     * so retrying an incomplete chapter reuses already-saved valid pages without re-downloading.
+     */
+    fun getExistingValidPageFile(
+        sourceId: Long,
+        workId: String,
+        chapterKey: String,
+        pageIndex: Int
+    ): File? {
+        val chapterDir = getChapterDir(sourceId, workId, chapterKey)
+        val prefix = String.format("page_%03d.", pageIndex + 1)
+        val matches = chapterDir.listFiles { file ->
+            file.isFile && file.name.startsWith(prefix)
+        } ?: return null
+        return matches.firstOrNull { isValidImageFile(it) }
+    }
+
+    fun saveCoverImage(sourceId: Long, workId: String, bytes: ByteArray, allowSyntheticFallback: Boolean = false): File {
         val workDir = getWorkDir(sourceId, workId)
         val coverFile = File(workDir, "cover.jpg")
         if (bytes.isNotEmpty() && isValidImageBytes(bytes)) {
-            coverFile.writeBytes(bytes)
-        } else if (!coverFile.exists() || coverFile.length() == 0L) {
+            val tmpFile = File(workDir, "cover.jpg.tmp")
+            tmpFile.writeBytes(bytes)
+            if (tmpFile.exists() && tmpFile.length() >= 64L) {
+                if (coverFile.exists()) coverFile.delete()
+                tmpFile.renameTo(coverFile)
+            }
+        } else if (allowSyntheticFallback && (!coverFile.exists() || coverFile.length() == 0L)) {
             coverFile.writeBytes(generateValidJpegBytes(title = workId, subtitle = "Cover", pageNumber = 0))
         }
         return coverFile
     }
 
     fun saveCoverImage(workId: String, bytes: ByteArray): String =
-        saveCoverImage(0L, workId, bytes).absolutePath
+        saveCoverImage(0L, workId, bytes, allowSyntheticFallback = false).absolutePath
 
     fun saveChapterPageImage(
         sourceId: Long,
@@ -71,10 +115,16 @@ class LocalStorageManager(private val context: Context) {
         extension: String = "jpg"
     ): File {
         val chapterDir = getChapterDir(sourceId, workId, chapterKey)
-        val safeExt = extension.lowercase().takeIf { it in setOf("jpg", "jpeg", "png", "webp") } ?: "jpg"
+        val safeExt = extension.lowercase().takeIf { it in setOf("jpg", "jpeg", "png", "webp", "gif") } ?: "jpg"
         val fileName = String.format("page_%03d.%s", pageIndex + 1, safeExt)
         val pageFile = File(chapterDir, fileName)
-        pageFile.writeBytes(bytes)
+        val tmpFile = File(chapterDir, "$fileName.tmp")
+        tmpFile.writeBytes(bytes)
+        if (pageFile.exists()) pageFile.delete()
+        if (!tmpFile.renameTo(pageFile)) {
+            pageFile.writeBytes(bytes)
+            tmpFile.delete()
+        }
         return pageFile
     }
 
@@ -140,29 +190,105 @@ class LocalStorageManager(private val context: Context) {
         return header + body + footer
     }
 
+    /**
+     * Validates that the downloaded payload is a real image (JPEG, PNG, WEBP, GIF, BMP, AVIF)
+     * and NOT an HTML error page, Cloudflare challenge, JSON error, or empty/corrupt response.
+     */
     fun isValidImageBytes(bytes: ByteArray): Boolean {
         if (bytes.size < 64) return false
+
+        // Reject HTML / XML / JSON error payloads masquerading as 200 OK
+        val headAscii = String(bytes, 0, minOf(bytes.size, 160), Charsets.UTF_8).trimStart()
+        if (headAscii.startsWith("<!DOCTYPE", ignoreCase = true) ||
+            headAscii.startsWith("<html", ignoreCase = true) ||
+            headAscii.startsWith("<head", ignoreCase = true) ||
+            headAscii.startsWith("<script", ignoreCase = true) ||
+            headAscii.startsWith("<?xml", ignoreCase = true) ||
+            headAscii.startsWith("{\"error\"", ignoreCase = true) ||
+            headAscii.contains("Attention Required! | Cloudflare", ignoreCase = true) ||
+            headAscii.contains("Just a moment...", ignoreCase = true)
+        ) {
+            return false
+        }
+
         val b0 = bytes[0].toInt() and 0xFF
         val b1 = bytes[1].toInt() and 0xFF
         val b2 = bytes[2].toInt() and 0xFF
         val b3 = bytes[3].toInt() and 0xFF
-        if (b0 == 0xFF && b1 == 0xD8) return true
+
+        // JPEG: FF D8 FF
+        if (b0 == 0xFF && b1 == 0xD8 && b2 == 0xFF) return true
+        // PNG: 89 50 4E 47
         if (b0 == 0x89 && b1 == 0x50 && b2 == 0x4E && b3 == 0x47) return true
+        // RIFF / WEBP: 52 49 46 46
         if (b0 == 0x52 && b1 == 0x49 && b2 == 0x46 && b3 == 0x46) return true
+        // GIF: 47 49 46 38
         if (b0 == 0x47 && b1 == 0x49 && b2 == 0x46 && b3 == 0x38) return true
-        val headStr = String(bytes.take(64).toByteArray(), Charsets.UTF_8).trimStart()
-        if (headStr.startsWith("<!DOCTYPE", ignoreCase = true) ||
-            headStr.startsWith("<html", ignoreCase = true)
-        ) {
-            return false
+        // BMP: 42 4D
+        if (b0 == 0x42 && b1 == 0x4D && bytes.size > 128) return true
+        // AVIF / HEIF ftyp box at offset 4..7 ('ftyp')
+        if (bytes.size >= 12) {
+            val b4 = bytes[4].toInt() and 0xFF
+            val b5 = bytes[5].toInt() and 0xFF
+            val b6 = bytes[6].toInt() and 0xFF
+            val b7 = bytes[7].toInt() and 0xFF
+            if (b4 == 0x66 && b5 == 0x74 && b6 == 0x79 && b7 == 0x70) return true
         }
-        return true
+
+        // Secondary check via BitmapFactory bounds decoding
+        return try {
+            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+            opts.outWidth > 0 && opts.outHeight > 0
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    fun isValidImageFile(file: File?): Boolean {
+        if (file == null || !file.exists() || !file.isFile || file.length() < 64L) return false
+        return try {
+            val headerBytes = file.inputStream().use { input ->
+                val buf = ByteArray(160)
+                val read = input.read(buf)
+                if (read <= 0) ByteArray(0) else buf.copyOf(read)
+            }
+            if (headerBytes.size < 16) return false
+            // Check magic header bytes
+            val b0 = headerBytes[0].toInt() and 0xFF
+            val b1 = headerBytes[1].toInt() and 0xFF
+            val b2 = headerBytes[2].toInt() and 0xFF
+            val b3 = headerBytes[3].toInt() and 0xFF
+            if (b0 == 0xFF && b1 == 0xD8 && b2 == 0xFF) return true
+            if (b0 == 0x89 && b1 == 0x50 && b2 == 0x4E && b3 == 0x47) return true
+            if (b0 == 0x52 && b1 == 0x49 && b2 == 0x46 && b3 == 0x46) return true
+            if (b0 == 0x47 && b1 == 0x49 && b2 == 0x46 && b3 == 0x38) return true
+            if (b0 == 0x42 && b1 == 0x4D) return true
+            if (headerBytes.size >= 12) {
+                val b4 = headerBytes[4].toInt() and 0xFF
+                val b5 = headerBytes[5].toInt() and 0xFF
+                val b6 = headerBytes[6].toInt() and 0xFF
+                val b7 = headerBytes[7].toInt() and 0xFF
+                if (b4 == 0x66 && b5 == 0x74 && b6 == 0x79 && b7 == 0x70) return true
+            }
+            val headAscii = String(headerBytes, Charsets.UTF_8).trimStart()
+            if (headAscii.startsWith("<!DOCTYPE", ignoreCase = true) ||
+                headAscii.startsWith("<html", ignoreCase = true)
+            ) {
+                return false
+            }
+            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, opts)
+            opts.outWidth > 0 && opts.outHeight > 0
+        } catch (_: Throwable) {
+            file.length() >= 64L
+        }
     }
 
     /**
-     * Strictly verifies that all required pages of a chapter exist on disk and are non-empty.
-     * If even a single page file is missing or 0 bytes, returns false so the chapter is never
-     * marked COMPLETED erroneously.
+     * Strictly verifies that all required pages of a chapter exist on disk and are valid image files.
+     * If even a single page file is missing, 0 bytes, or an HTML error file, returns false so the
+     * chapter is never marked COMPLETED erroneously.
      */
     fun verifyChapterFilesComplete(expectedPageCount: Int, localPaths: List<String>): Boolean {
         if (expectedPageCount <= 0) return false
@@ -170,7 +296,7 @@ class LocalStorageManager(private val context: Context) {
         for (path in localPaths) {
             if (path.isBlank()) return false
             val file = File(path)
-            if (!file.exists() || !file.isFile || file.length() < 64L) {
+            if (!isValidImageFile(file)) {
                 return false
             }
         }
@@ -205,6 +331,15 @@ class LocalStorageManager(private val context: Context) {
             list
         } catch (_: Exception) {
             emptyList()
+        }
+    }
+
+    /**
+     * Returns only the paths from `localPaths` that currently exist and are valid image files on disk.
+     */
+    fun filterExistingValidPagePaths(localPaths: List<String>): List<String> {
+        return localPaths.filter { path ->
+            path.isNotBlank() && isValidImageFile(File(path))
         }
     }
 

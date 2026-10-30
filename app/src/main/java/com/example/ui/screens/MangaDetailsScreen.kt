@@ -51,6 +51,7 @@ import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
@@ -87,6 +88,7 @@ import androidx.compose.ui.unit.sp
 import com.example.data.LiveMangaSiteScraper
 import com.example.data.MangaChapter
 import com.example.data.MangaWork
+import com.example.data.local.DownloadedChapterEntity
 import com.example.data.local.SiteEntity
 import com.example.ui.components.CloudflareProtectionDialog
 import com.example.ui.components.HiddenSiteWebViewBridge
@@ -109,6 +111,7 @@ fun MangaDetailsScreen(
     work: MangaWork,
     isFavorite: Boolean,
     downloadedChapterNumbers: Set<Int>,
+    chapterDownloadStates: Map<Int, DownloadedChapterEntity> = emptyMap(),
     readChapterNumbers: Set<Int> = emptySet(),
     resumeLabel: String = "",
     addedSites: List<SiteEntity> = emptyList(),
@@ -750,17 +753,49 @@ fun MangaDetailsScreen(
                         }
                     }
                 } else {
+                    val chaptersToDisplay = if (liveWork.isFromLocalStorage) {
+                        displayedChapters.filter { ch ->
+                            val st = chapterDownloadStates[ch.number]?.status?.ifBlank { ch.downloadStatus } ?: ch.downloadStatus
+                            (ch.number in downloadedChapterNumbers) || (ch.isDownloaded && st == "COMPLETED")
+                        }
+                    } else {
+                        displayedChapters
+                    }
+                    val incompleteStorageChapters = if (liveWork.isFromLocalStorage) {
+                        displayedChapters.filter { ch ->
+                            val st = chapterDownloadStates[ch.number]?.status?.ifBlank { ch.downloadStatus } ?: ch.downloadStatus
+                            !((ch.number in downloadedChapterNumbers) || (ch.isDownloaded && st == "COMPLETED"))
+                        }
+                    } else {
+                        emptyList()
+                    }
+
                     LazyColumn(
                         modifier = Modifier
                             .fillMaxSize()
                             .testTag("chapters_lazy_column"),
                         contentPadding = PaddingValues(vertical = 6.dp)
                     ) {
-                        items(displayedChapters, key = { it.id }) { chapter ->
+                        if (liveWork.isFromLocalStorage && chaptersToDisplay.isNotEmpty()) {
+                            item(key = "completed_offline_header") {
+                                Text(
+                                    text = "الفصول المكتملة (جاهزة بدون إنترنت: ${chaptersToDisplay.size})",
+                                    color = Color(0xFF81C784),
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                                )
+                            }
+                        }
+
+                        items(chaptersToDisplay, key = { "ch_${it.id}" }) { chapter ->
+                            val liveChState = chapterDownloadStates[chapter.number]
+                            val effectiveStatus = liveChState?.status?.ifBlank { chapter.downloadStatus } ?: chapter.downloadStatus
                             val isSaved = (chapter.number in downloadedChapterNumbers) ||
-                                (chapter.localPagePaths.isNotEmpty() && chapter.downloadStatus == "COMPLETED")
-                            val isIncomplete = chapter.downloadStatus == "INCOMPLETE"
-                            val isRead = (chapter.number in readChapterNumbers) || (chapter.lastReadPage >= 0)
+                                (chapter.localPagePaths.isNotEmpty() && effectiveStatus == "COMPLETED")
+                            val isDownloading = effectiveStatus == "DOWNLOADING" || effectiveStatus == "QUEUED"
+                            val isIncomplete = !isSaved && (effectiveStatus == "INCOMPLETE" || effectiveStatus == "FAILED")
+                            val isRead = (chapter.number in readChapterNumbers) || chapter.isRead || (chapter.lastReadPage >= 0)
                             val showMenuForThis = activeChapterMenuId == chapter.id
 
                             Box(modifier = Modifier.fillMaxWidth()) {
@@ -775,7 +810,7 @@ fun MangaDetailsScreen(
                                         .testTag("chapter_row_${chapter.number}"),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    // Right side in RTL: Circular Chapter Number / Checkmark Badge
+                                    // Right side in RTL: Circular Chapter Number / Checkmark / Progress Badge
                                     Box(
                                         modifier = Modifier
                                             .size(34.dp)
@@ -783,6 +818,7 @@ fun MangaDetailsScreen(
                                             .background(
                                                 when {
                                                     isSaved -> Color(0xFF1E3B2B)
+                                                    isDownloading -> Color(0xFF1F273B)
                                                     isIncomplete -> Color(0xFF3E2723)
                                                     isRead -> Color(0xFF232838)
                                                     else -> Color(0xFF1A1D26)
@@ -792,6 +828,7 @@ fun MangaDetailsScreen(
                                                 width = 1.dp,
                                                 color = when {
                                                     isSaved -> Color(0xFF4CAF50)
+                                                    isDownloading -> PeriwinklePrimary
                                                     isIncomplete -> Color(0xFFFF8A80)
                                                     isRead -> PeriwinklePrimary.copy(alpha = 0.6f)
                                                     else -> Color(0xFF3E4352)
@@ -808,6 +845,13 @@ fun MangaDetailsScreen(
                                                     imageVector = Icons.Default.Check,
                                                     contentDescription = "محفوظ",
                                                     tint = Color(0xFF4CAF50),
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                            }
+                                            isDownloading -> {
+                                                CircularProgressIndicator(
+                                                    color = PeriwinklePrimary,
+                                                    strokeWidth = 2.dp,
                                                     modifier = Modifier.size(16.dp)
                                                 )
                                             }
@@ -845,14 +889,24 @@ fun MangaDetailsScreen(
                                             overflow = TextOverflow.Ellipsis
                                         )
                                         val subText = buildList {
-                                            if (chapter.lastReadTimeText.isNotBlank()) {
-                                                add(chapter.lastReadTimeText)
-                                            } else if (chapter.dateText.isNotBlank()) {
-                                                add(chapter.dateText)
+                                            if (isDownloading) {
+                                                val done = liveChState?.downloadedPagesCount ?: chapter.downloadedPagesCount
+                                                val tot = (liveChState?.pageCount ?: chapter.pageCount).coerceAtLeast(1)
+                                                add("جارٍ التنزيل ($done من $tot صفحة)")
+                                            } else {
+                                                if (chapter.lastReadTimeText.isNotBlank()) {
+                                                    add(chapter.lastReadTimeText)
+                                                } else if (chapter.dateText.isNotBlank()) {
+                                                    add(chapter.dateText)
+                                                }
+                                                if (isSaved) add("تم التنزيل")
+                                                if (isIncomplete) {
+                                                    val done = liveChState?.downloadedPagesCount ?: chapter.downloadedPagesCount
+                                                    val tot = (liveChState?.pageCount ?: chapter.pageCount).coerceAtLeast(1)
+                                                    add("غير مكتمل ($done/$tot)")
+                                                }
+                                                if (isRead && chapter.lastReadTimeText.isBlank()) add("مقروء")
                                             }
-                                            if (isSaved) add("محفوظ بدون إنترنت")
-                                            if (isIncomplete) add("غير مكتمل")
-                                            if (isRead && chapter.lastReadTimeText.isBlank()) add("مقروء")
                                         }.joinToString(" • ")
 
                                         if (subText.isNotBlank()) {
@@ -860,6 +914,7 @@ fun MangaDetailsScreen(
                                             Text(
                                                 text = subText,
                                                 color = when {
+                                                    isDownloading -> PeriwinklePrimary
                                                     isIncomplete -> Color(0xFFFF8A80)
                                                     isSaved -> Color(0xFF81C784)
                                                     else -> TextSecondaryGrey
@@ -870,7 +925,7 @@ fun MangaDetailsScreen(
                                     }
                                 }
 
-                                // Chapter Context Menu (00:27 - 00:28 + Offline Delete option)
+                                // Chapter Context Menu
                                 DropdownMenu(
                                     expanded = showMenuForThis,
                                     onDismissRequest = { activeChapterMenuId = null },
@@ -879,7 +934,7 @@ fun MangaDetailsScreen(
                                     DropdownMenuItem(
                                         text = {
                                             Text(
-                                                text = "حفظ هذا الفصل",
+                                                text = if (isIncomplete) "استكمال / إعادة تنزيل الفصل" else "حفظ هذا الفصل",
                                                 color = TextPrimaryWhite,
                                                 fontSize = 14.sp,
                                                 fontWeight = FontWeight.SemiBold
@@ -890,7 +945,7 @@ fun MangaDetailsScreen(
                                             onDownloadChapters(
                                                 liveWork,
                                                 listOf(chapter),
-                                                "بدأ التنزيل 😭"
+                                                if (isIncomplete) "جارٍ استكمال تنزيل ${chapter.title}..." else "بدأ التنزيل 😭"
                                             )
                                         }
                                     )
@@ -947,6 +1002,93 @@ fun MangaDetailsScreen(
                                                 onDeleteSingleDownloadedChapter(liveWork, chapter)
                                             }
                                         )
+                                    }
+                                }
+                            }
+                        }
+
+                        // Separate section for incomplete/failed chapters when opened from Storage
+                        if (incompleteStorageChapters.isNotEmpty()) {
+                            item(key = "incomplete_offline_header") {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                HorizontalDivider(color = Color(0xFF2E3342))
+                                Text(
+                                    text = "فصول غير مكتملة أو قيد التنزيل (${incompleteStorageChapters.size})",
+                                    color = Color(0xFFFFB74D),
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                )
+                            }
+                            items(incompleteStorageChapters, key = { "inc_${it.id}" }) { incChapter ->
+                                val liveChState = chapterDownloadStates[incChapter.number]
+                                val effectiveStatus = liveChState?.status?.ifBlank { incChapter.downloadStatus } ?: incChapter.downloadStatus
+                                val isDownloading = effectiveStatus == "DOWNLOADING" || effectiveStatus == "QUEUED"
+                                val done = liveChState?.downloadedPagesCount ?: incChapter.downloadedPagesCount
+                                val tot = (liveChState?.pageCount ?: incChapter.pageCount).coerceAtLeast(1)
+
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            if (isDownloading) {
+                                                onOpenChapter(liveWork, incChapter)
+                                            } else {
+                                                onDownloadChapters(
+                                                    liveWork,
+                                                    listOf(incChapter),
+                                                    "جارٍ استكمال تنزيل ${incChapter.title}..."
+                                                )
+                                            }
+                                        }
+                                        .padding(horizontal = 10.dp, vertical = 8.dp)
+                                        .testTag("incomplete_chapter_row_${incChapter.number}"),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(30.dp)
+                                                .clip(CircleShape)
+                                                .background(if (isDownloading) Color(0xFF1F273B) else Color(0xFF3E2723)),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            if (isDownloading) {
+                                                CircularProgressIndicator(
+                                                    color = PeriwinklePrimary,
+                                                    strokeWidth = 2.dp,
+                                                    modifier = Modifier.size(14.dp)
+                                                )
+                                            } else {
+                                                Icon(
+                                                    imageVector = Icons.Default.Warning,
+                                                    contentDescription = "غير مكتمل",
+                                                    tint = Color(0xFFFF8A80),
+                                                    modifier = Modifier.size(14.dp)
+                                                )
+                                            }
+                                        }
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Column {
+                                            Text(
+                                                text = incChapter.title,
+                                                color = TextPrimaryWhite,
+                                                fontSize = 12.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                            Text(
+                                                text = if (isDownloading) "جارٍ التنزيل ($done من $tot صفحة)" else "غير مكتمل ($done من $tot صفحة) • اضغط للاستكمال",
+                                                color = if (isDownloading) PeriwinklePrimary else Color(0xFFFF8A80),
+                                                fontSize = 10.sp
+                                            )
+                                        }
+                                    }
+                                    TextButton(onClick = { onOpenChapter(liveWork, incChapter) }) {
+                                        Text("فتح المتاح", color = PeriwinklePrimary, fontSize = 11.sp)
                                     }
                                 }
                             }

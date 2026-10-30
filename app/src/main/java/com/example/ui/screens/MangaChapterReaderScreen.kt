@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -25,6 +26,7 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
@@ -33,9 +35,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Comment
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.BookmarkBorder
+import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Refresh
@@ -51,6 +57,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -88,9 +96,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.DiagnosticLevel
+import com.example.data.DiagnosticLogEntry
+import com.example.data.DiagnosticLogger
 import com.example.data.LiveMangaSiteScraper
 import com.example.data.MangaChapter
 import com.example.data.MangaWork
+import com.example.data.local.DownloadedChapterEntity
 import com.example.data.preferences.UserSettings
 import com.example.ui.components.ChapterPageIllustration
 import com.example.ui.components.CloudflareProtectionDialog
@@ -113,6 +125,9 @@ fun MangaChapterReaderScreen(
     settings: UserSettings,
     isFavorite: Boolean,
     initialPageIndex: Int = 0,
+    liveChapterDownloadState: DownloadedChapterEntity? = null,
+    diagnosticLogs: List<DiagnosticLogEntry> = emptyList(),
+    onClearDiagnosticLogs: () -> Unit = {},
     onSaveReadingProgress: (Int) -> Unit = {},
     onBackClick: () -> Unit,
     onSelectChapter: (MangaChapter) -> Unit,
@@ -124,12 +139,17 @@ fun MangaChapterReaderScreen(
 ) {
     val scope = rememberCoroutineScope()
 
-    val isOfflineComplete = remember(chapter.id, chapter.localPagePaths, chapter.downloadStatus) {
-        chapter.localPagePaths.isNotEmpty() && chapter.downloadStatus == "COMPLETED"
+    val effectiveDownloadStatus = liveChapterDownloadState?.status?.ifBlank { chapter.downloadStatus }
+        ?: chapter.downloadStatus
+
+    val isOfflineComplete = remember(chapter.id, chapter.localPagePaths, effectiveDownloadStatus) {
+        chapter.localPagePaths.isNotEmpty() && effectiveDownloadStatus == "COMPLETED"
     }
-    val isOfflineIncomplete = remember(chapter.id, chapter.downloadStatus) {
-        chapter.downloadStatus == "INCOMPLETE"
+    val isOfflineIncomplete = remember(chapter.id, chapter.localPagePaths, effectiveDownloadStatus) {
+        effectiveDownloadStatus == "INCOMPLETE" ||
+            (chapter.localPagePaths.isNotEmpty() && effectiveDownloadStatus != "COMPLETED")
     }
+    val isActivelyDownloading = effectiveDownloadStatus == "DOWNLOADING" || effectiveDownloadStatus == "QUEUED"
 
     var localPagePaths by remember(chapter.id, chapter.localPagePaths) {
         mutableStateOf(chapter.localPagePaths)
@@ -138,12 +158,17 @@ fun MangaChapterReaderScreen(
         mutableStateOf(chapter.pageImageUrls)
     }
     var loadingProgress by remember(chapter.id, isOfflineComplete) {
-        mutableIntStateOf(if (isOfflineComplete || chapter.pageImageUrls.isNotEmpty()) 100 else 3)
+        mutableIntStateOf(
+            if (isOfflineComplete || chapter.localPagePaths.isNotEmpty() || chapter.pageImageUrls.isNotEmpty()) 100 else 5
+        )
     }
     var isChapterLoaded by remember(chapter.id, isOfflineComplete) {
-        mutableStateOf(isOfflineComplete || chapter.pageImageUrls.isNotEmpty())
+        mutableStateOf(
+            isOfflineComplete || chapter.localPagePaths.isNotEmpty() || chapter.pageImageUrls.isNotEmpty()
+        )
     }
     var requiresCloudflare by remember(chapter.id, chapter.chapterUrl) { mutableStateOf(false) }
+    var lastScrapeError by remember(chapter.id) { mutableStateOf<String?>(null) }
     var showProtectionModal by remember { mutableStateOf(false) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
 
@@ -153,7 +178,7 @@ fun MangaChapterReaderScreen(
         }
     }
 
-    // Only fetch from network if NOT reading a completed local chapter (100% offline support!)
+    // Only fetch from network if NOT reading a completed local chapter (100% offline support in Airplane mode!)
     LaunchedEffect(chapter.id, targetChapterUrl, isOfflineComplete, refreshTrigger) {
         if (isOfflineComplete && refreshTrigger == 0) {
             loadingProgress = 100
@@ -161,35 +186,37 @@ fun MangaChapterReaderScreen(
             return@LaunchedEffect
         }
         if ((livePageUrls.isEmpty() && localPagePaths.isEmpty()) || refreshTrigger > 0) {
-            isChapterLoaded = false
-            loadingProgress = 3
-            delay(90)
-            loadingProgress = 16
-            delay(90)
-            loadingProgress = 27
+            if (localPagePaths.isEmpty()) {
+                isChapterLoaded = false
+                loadingProgress = 12
+            }
             val res = LiveMangaSiteScraper.fetchChapterPages(work, chapter.copy(chapterUrl = targetChapterUrl))
-            loadingProgress = 57
-            delay(90)
-            loadingProgress = 79
+            loadingProgress = 68
             if (res.pageUrls.isNotEmpty()) {
-                livePageUrls = res.pageUrls
+                // Keep whichever list has more pages so we never regress to 1 page
+                if (res.pageUrls.size >= livePageUrls.size) {
+                    livePageUrls = res.pageUrls
+                }
                 requiresCloudflare = false
+                lastScrapeError = null
                 loadingProgress = 100
                 isChapterLoaded = true
             } else if (res.requiresCloudflare) {
                 requiresCloudflare = true
+                lastScrapeError = res.errorMessage
                 loadingProgress = 97
                 isChapterLoaded = true
             } else {
+                lastScrapeError = res.errorMessage
                 loadingProgress = 97
-                delay(1200)
+                delay(900)
                 isChapterLoaded = true
             }
         }
     }
 
-    // Hidden WebView DOM Bridge only when online and not reading from local disk
-    if (!isOfflineComplete || refreshTrigger > 0) {
+    // Hidden WebView DOM Bridge only when online and not reading a completed offline chapter
+    if ((!isOfflineComplete && targetChapterUrl.startsWith("http")) || refreshTrigger > 0) {
         HiddenSiteWebViewBridge(
             targetUrl = targetChapterUrl,
             jsExtractorScript = LiveMangaSiteScraper.JS_EXTRACT_CHAPTER_PAGES,
@@ -197,8 +224,11 @@ fun MangaChapterReaderScreen(
             onResultJson = { rawJson ->
                 val domRes = LiveMangaSiteScraper.parseChapterPagesFromDomJson(rawJson, targetChapterUrl)
                 if (domRes.pageUrls.isNotEmpty()) {
-                    livePageUrls = domRes.pageUrls
+                    if (domRes.pageUrls.size > livePageUrls.size) {
+                        livePageUrls = domRes.pageUrls
+                    }
                     requiresCloudflare = false
+                    lastScrapeError = null
                     loadingProgress = 100
                     isChapterLoaded = true
                 } else if (domRes.requiresCloudflare && livePageUrls.isEmpty() && localPagePaths.isEmpty()) {
@@ -210,8 +240,10 @@ fun MangaChapterReaderScreen(
     }
 
     val effectivePageCount = when {
-        localPagePaths.isNotEmpty() -> localPagePaths.size
+        isOfflineComplete -> localPagePaths.size
+        isOfflineIncomplete -> maxOf(localPagePaths.size, livePageUrls.size, chapter.pageCount)
         livePageUrls.isNotEmpty() -> livePageUrls.size
+        localPagePaths.isNotEmpty() -> localPagePaths.size
         else -> 0
     }
     val totalPages = effectivePageCount.coerceAtLeast(1)
@@ -220,30 +252,40 @@ fun MangaChapterReaderScreen(
     var showQuickTunePopup by remember { mutableStateOf(false) }
     var showCommentsDialog by remember { mutableStateOf(false) }
     var showPagesGridDialog by remember { mutableStateOf(false) }
+    var showChaptersListSheet by remember { mutableStateOf(false) }
+    var showDiagnosticsDialog by remember { mutableStateOf(false) }
     var isBookmarked by remember(chapter.id) { mutableStateOf(false) }
     var zoomScale by remember { mutableFloatStateOf(1f) }
     var isWebtoonMode by remember(settings.webtoonAlwaysOn) { mutableStateOf(settings.webtoonAlwaysOn) }
 
+    val safeInitialPage = remember(chapter.id, initialPageIndex, totalPages) {
+        initialPageIndex.coerceIn(0, (totalPages - 1).coerceAtLeast(0))
+    }
+
     val webtoonListState = rememberLazyListState(
-        initialFirstVisibleItemIndex = initialPageIndex.coerceAtLeast(0)
+        initialFirstVisibleItemIndex = safeInitialPage
     )
     val pagerState = rememberPagerState(
-        initialPage = initialPageIndex.coerceAtLeast(0),
+        initialPage = safeInitialPage,
         pageCount = { totalPages }
     )
 
     val currentPageIndex by remember {
         derivedStateOf {
             if (isWebtoonMode) {
-                webtoonListState.firstVisibleItemIndex.coerceIn(0, (totalPages - 1).coerceAtLeast(0))
+                val baseIdx = webtoonListState.firstVisibleItemIndex
+                val adjusted = if (isOfflineIncomplete && baseIdx > 0) baseIdx - 1 else baseIdx
+                adjusted.coerceIn(0, (totalPages - 1).coerceAtLeast(0))
             } else {
                 pagerState.currentPage.coerceIn(0, (totalPages - 1).coerceAtLeast(0))
             }
         }
     }
 
-    LaunchedEffect(currentPageIndex) {
-        onSaveReadingProgress(currentPageIndex)
+    LaunchedEffect(currentPageIndex, isChapterLoaded) {
+        if (isChapterLoaded && effectivePageCount > 0) {
+            onSaveReadingProgress(currentPageIndex)
+        }
     }
 
     // Auto-scroll support if enabled in settings
@@ -266,18 +308,24 @@ fun MangaChapterReaderScreen(
         val clamped = targetIndex.coerceIn(0, (totalPages - 1).coerceAtLeast(0))
         scope.launch {
             if (isWebtoonMode) {
-                webtoonListState.animateScrollToItem(clamped)
+                val targetListIdx = if (isOfflineIncomplete) clamped + 1 else clamped
+                webtoonListState.animateScrollToItem(targetListIdx)
             } else {
                 pagerState.animateScrollToPage(clamped)
             }
         }
     }
 
-    val prevChapter = remember(work.chapters, chapter.number) {
-        work.chapters.find { it.number == chapter.number - 1 }
+    val sortedWorkChapters = remember(work.chapters) {
+        work.chapters.sortedBy { it.number }
     }
-    val nextChapter = remember(work.chapters, chapter.number) {
-        work.chapters.find { it.number == chapter.number + 1 }
+    val prevChapter = remember(sortedWorkChapters, chapter.number) {
+        sortedWorkChapters.lastOrNull { it.number < chapter.number }
+            ?: work.chapters.find { it.number == chapter.number - 1 }
+    }
+    val nextChapter = remember(sortedWorkChapters, chapter.number) {
+        sortedWorkChapters.firstOrNull { it.number > chapter.number }
+            ?: work.chapters.find { it.number == chapter.number + 1 }
     }
 
     Box(
@@ -292,6 +340,7 @@ fun MangaChapterReaderScreen(
                         if (showQuickTunePopup) {
                             showQuickTunePopup = false
                         } else {
+                            // Toggles HUD visibility smoothly without causing any page image recomposition/reload
                             showReaderHud = !showReaderHud
                         }
                     },
@@ -306,42 +355,37 @@ fun MangaChapterReaderScreen(
     ) {
         // ==================== MAIN READER AREA (OFFLINE LOCAL FILES OR LIVE CHAPTER PAGES) ====================
         if (!isChapterLoaded) {
-            // Exact Loading Screen from 00:39 - 00:47:
-            // "التحميل: ٢٧٪" + Horizontal LinearProgressIndicator
             Box(
                 modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center
             ) {
-                if (loadingProgress <= 5) {
-                    Icon(
-                        imageVector = Icons.Default.Refresh,
-                        contentDescription = null,
-                        tint = Color(0xFF8C92A4),
-                        modifier = Modifier.size(48.dp)
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(
+                        color = PeriwinklePrimary,
+                        strokeWidth = 3.dp,
+                        modifier = Modifier.size(38.dp)
                     )
-                } else {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(
-                            text = "التحميل: ${MainViewModel.toArabicDigits(loadingProgress.toString())}٪",
-                            color = TextPrimaryWhite,
-                            fontSize = 15.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Spacer(modifier = Modifier.height(10.dp))
-                        LinearProgressIndicator(
-                            progress = { loadingProgress / 100f },
-                            color = PeriwinklePrimary,
-                            trackColor = Color(0xFF2D313E),
-                            modifier = Modifier
-                                .width(156.dp)
-                                .height(3.dp)
-                                .clip(RoundedCornerShape(2.dp))
-                        )
-                    }
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(
+                        text = "جارٍ استخراج صفحات ${chapter.title} (${MainViewModel.toArabicDigits(loadingProgress.toString())}٪)",
+                        color = TextPrimaryWhite,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    LinearProgressIndicator(
+                        progress = { loadingProgress / 100f },
+                        color = PeriwinklePrimary,
+                        trackColor = Color(0xFF2D313E),
+                        modifier = Modifier
+                            .width(170.dp)
+                            .height(3.dp)
+                            .clip(RoundedCornerShape(2.dp))
+                    )
                 }
             }
         } else if (effectivePageCount == 0) {
-            // Prompt to verify Cloudflare or reload chapter images from website
+            // Prompt to verify Cloudflare, retry, or inspect diagnostics
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -360,9 +404,9 @@ fun MangaChapterReaderScreen(
                     )
                     Text(
                         text = if (requiresCloudflare) {
-                            "يتطلب الفصل تخطي حماية Cloudflare لتحميل صور المانجا من الموقع"
+                            "يتطلب الفصل تخطي حماية Cloudflare لتحميل جميع صفحات المانجا من الموقع"
                         } else {
-                            "تعذر استخراج صور الفصل تلقائياً — افتح نافذة الحماية لتحميل الصفحات مباشرة"
+                            lastScrapeError ?: "تعذر استخراج صور الفصل تلقائياً — افتح نافذة الحماية لتحميل الصفحات مباشرة"
                         },
                         color = TextPrimaryWhite,
                         fontSize = 14.sp,
@@ -387,13 +431,19 @@ fun MangaChapterReaderScreen(
                             Text("إعادة المحاولة", color = TextPrimaryWhite)
                         }
                     }
+                    TextButton(onClick = { showDiagnosticsDialog = true }) {
+                        Icon(Icons.Default.BugReport, contentDescription = null, tint = TextSecondaryGrey, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("عرض سجل التشخيص التقني", color = TextSecondaryGrey, fontSize = 12.sp)
+                    }
                 }
             }
         } else {
             if (isWebtoonMode) {
-                // Continuous Vertical Webtoon Strip displaying local files or live website images
+                // Continuous Vertical Webtoon Strip with zero unnecessary gaps between panels
                 LazyColumn(
                     state = webtoonListState,
+                    verticalArrangement = Arrangement.spacedBy(0.dp),
                     modifier = Modifier
                         .fillMaxSize()
                         .graphicsLayer(
@@ -422,24 +472,44 @@ fun MangaChapterReaderScreen(
                                         verticalAlignment = Alignment.CenterVertically,
                                         modifier = Modifier.weight(1f)
                                     ) {
-                                        Icon(Icons.Default.Warning, null, tint = Color(0xFFFF8A80))
+                                        Icon(Icons.Default.Warning, contentDescription = null, tint = Color(0xFFFF8A80))
                                         Spacer(modifier = Modifier.width(8.dp))
-                                        Text(
-                                            text = "هذا الفصل غير مكتمل (${localPagePaths.size}/${chapter.pageCount} صور)",
-                                            color = TextPrimaryWhite,
-                                            fontSize = 12.sp,
-                                            fontWeight = FontWeight.Bold
-                                        )
+                                        Column {
+                                            Text(
+                                                text = "هذا الفصل غير مكتمل (${localPagePaths.size} من $effectivePageCount صفحة محفوظة)",
+                                                color = TextPrimaryWhite,
+                                                fontSize = 12.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                            if (chapter.downloadError.isNotBlank()) {
+                                                Text(
+                                                    text = chapter.downloadError,
+                                                    color = Color(0xFFFFCCBC),
+                                                    fontSize = 11.sp
+                                                )
+                                            }
+                                        }
                                     }
-                                    TextButton(onClick = { onDownloadChapter(work, chapter) }) {
-                                        Text("إعادة التنزيل", color = PeriwinklePrimary, fontWeight = FontWeight.Bold)
+                                    TextButton(
+                                        onClick = {
+                                            onDownloadChapter(
+                                                work,
+                                                chapter.copy(
+                                                    pageImageUrls = livePageUrls,
+                                                    pageCount = effectivePageCount
+                                                )
+                                            )
+                                        },
+                                        modifier = Modifier.testTag("reader_resume_incomplete_button")
+                                    ) {
+                                        Text("استكمال التنزيل", color = PeriwinklePrimary, fontWeight = FontWeight.Bold)
                                     }
                                 }
                             }
                         }
                     }
 
-                    items(effectivePageCount, key = { "page_$it" }) { pageIdx ->
+                    items(effectivePageCount, key = { "page_${chapter.id}_$it" }) { pageIdx ->
                         ChapterPageIllustration(
                             work = work,
                             chapterNumber = chapter.number,
@@ -451,7 +521,7 @@ fun MangaChapterReaderScreen(
                         )
                     }
 
-                    // End of Chapter Summary & Next Chapter Card
+                    // End of Chapter Summary & Next/Prev Chapter Card
                     item(key = "chapter_footer") {
                         Column(
                             modifier = Modifier
@@ -462,9 +532,9 @@ fun MangaChapterReaderScreen(
                             verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
                             Text(
-                                text = "نهاية ${chapter.title}",
+                                text = "نهاية ${chapter.title} (${effectivePageCount} صفحة)",
                                 color = TextPrimaryWhite,
-                                fontSize = 17.sp,
+                                fontSize = 16.sp,
                                 fontWeight = FontWeight.Bold
                             )
 
@@ -478,7 +548,7 @@ fun MangaChapterReaderScreen(
                                         shape = RoundedCornerShape(22.dp),
                                         modifier = Modifier.weight(1f)
                                     ) {
-                                        Text("الفصل السابق", color = TextPrimaryWhite)
+                                        Text("الفصل السابق (${prevChapter.number})", color = TextPrimaryWhite)
                                     }
                                 }
                                 if (nextChapter != null) {
@@ -491,7 +561,7 @@ fun MangaChapterReaderScreen(
                                         ),
                                         modifier = Modifier.weight(1f)
                                     ) {
-                                        Text("الفصل التالي", fontWeight = FontWeight.Bold)
+                                        Text("الفصل التالي (${nextChapter.number})", fontWeight = FontWeight.Bold)
                                     }
                                 }
                             }
@@ -537,7 +607,7 @@ fun MangaChapterReaderScreen(
             )
         }
 
-        // ==================== TOP READER BAR (00:41 - 00:52) ====================
+        // ==================== COMPACT TOP READER BAR ====================
         AnimatedVisibility(
             visible = showReaderHud,
             enter = fadeIn(),
@@ -552,8 +622,8 @@ fun MangaChapterReaderScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(56.dp)
-                        .padding(horizontal = 6.dp),
+                        .height(52.dp)
+                        .padding(horizontal = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(
@@ -570,25 +640,67 @@ fun MangaChapterReaderScreen(
                     Column(
                         modifier = Modifier
                             .weight(1f)
-                            .padding(horizontal = 6.dp)
+                            .padding(horizontal = 4.dp)
                     ) {
                         Text(
                             text = work.title,
                             color = TextPrimaryWhite,
-                            fontSize = 14.sp,
+                            fontSize = 13.sp,
                             fontWeight = FontWeight.Bold,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                        val subtitleStatus = when {
+                            isOfflineComplete -> "${chapter.title} • محفوظ بدون إنترنت (${localPagePaths.size} ص)"
+                            isOfflineIncomplete -> "${chapter.title} • غير مكتمل (${localPagePaths.size}/$effectivePageCount ص)"
+                            isActivelyDownloading -> {
+                                val done = liveChapterDownloadState?.downloadedPagesCount ?: 0
+                                val tot = liveChapterDownloadState?.pageCount ?: effectivePageCount
+                                "${chapter.title} • جارٍ التنزيل ($done/$tot)"
+                            }
+                            else -> "${chapter.title} • صفحة ${currentPageIndex + 1} من $totalPages"
+                        }
                         Text(
-                            text = if (isOfflineComplete) "${chapter.title} • بدون إنترنت" else chapter.title,
-                            color = if (isOfflineComplete) Color(0xFF81C784) else TextSecondaryGrey,
+                            text = subtitleStatus,
+                            color = when {
+                                isOfflineComplete -> Color(0xFF81C784)
+                                isOfflineIncomplete -> Color(0xFFFFB74D)
+                                isActivelyDownloading -> PeriwinklePrimary
+                                else -> TextSecondaryGrey
+                            },
                             fontSize = 11.sp,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
                     }
 
+                    // Chapters Switcher Button ("قائمة الفصول")
+                    IconButton(
+                        onClick = { showChaptersListSheet = true },
+                        modifier = Modifier.testTag("reader_chapters_list_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.List,
+                            contentDescription = "قائمة الفصول",
+                            tint = TextPrimaryWhite,
+                            modifier = Modifier.size(21.dp)
+                        )
+                    }
+
+                    // Pages Grid Jumper Button
+                    IconButton(
+                        onClick = { showPagesGridDialog = true },
+                        modifier = Modifier.testTag("reader_pages_grid_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Apps,
+                            contentDescription = "الانتقال بين الصفحات",
+                            tint = TextPrimaryWhite,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+
+                    // Cloudflare / Site Protection Button
                     IconButton(
                         onClick = { showProtectionModal = true },
                         modifier = Modifier.testTag("reader_protection_button")
@@ -597,38 +709,40 @@ fun MangaChapterReaderScreen(
                             imageVector = Icons.Default.Security,
                             contentDescription = "حماية الموقع",
                             tint = if (requiresCloudflare) Color(0xFFFFB74D) else PeriwinklePrimary,
+                            modifier = Modifier.size(19.dp)
+                        )
+                    }
+
+                    // Developer Diagnostics Log Button
+                    IconButton(
+                        onClick = { showDiagnosticsDialog = true },
+                        modifier = Modifier.testTag("reader_diagnostics_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.BugReport,
+                            contentDescription = "سجل التشخيص",
+                            tint = TextSecondaryGrey,
+                            modifier = Modifier.size(19.dp)
+                        )
+                    }
+
+                    // Quick Reader Settings Button in Top Bar as well
+                    IconButton(
+                        onClick = { showQuickTunePopup = !showQuickTunePopup },
+                        modifier = Modifier.testTag("reader_top_settings_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Tune,
+                            contentDescription = "إعدادات القارئ",
+                            tint = if (showQuickTunePopup) PeriwinklePrimary else TextPrimaryWhite,
                             modifier = Modifier.size(20.dp)
-                        )
-                    }
-
-                    IconButton(
-                        onClick = { showCommentsDialog = true },
-                        modifier = Modifier.testTag("reader_comments_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.Comment,
-                            contentDescription = "التعليقات",
-                            tint = TextPrimaryWhite,
-                            modifier = Modifier.size(21.dp)
-                        )
-                    }
-
-                    IconButton(
-                        onClick = { showPagesGridDialog = true },
-                        modifier = Modifier.testTag("reader_pages_grid_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Apps,
-                            contentDescription = "صفحات وفصول العمل",
-                            tint = TextPrimaryWhite,
-                            modifier = Modifier.size(22.dp)
                         )
                     }
                 }
             }
         }
 
-        // ==================== QUICK TUNE POPUP (00:44 - 00:46: وضع الويبتون ☑ / الاعدادات) ====================
+        // ==================== QUICK TUNE POPUP (وضع الويبتون ☑ / الاعدادات) ====================
         AnimatedVisibility(
             visible = showReaderHud && showQuickTunePopup,
             enter = fadeIn(),
@@ -643,7 +757,7 @@ fun MangaChapterReaderScreen(
                 tonalElevation = 8.dp,
                 shadowElevation = 8.dp,
                 modifier = Modifier
-                    .width(205.dp)
+                    .width(215.dp)
                     .testTag("reader_quick_tune_popup")
             ) {
                 Column(modifier = Modifier.padding(vertical = 6.dp)) {
@@ -673,10 +787,29 @@ fun MangaChapterReaderScreen(
                             modifier = Modifier.size(22.dp)
                         )
                         Text(
-                            text = "وضع الويبتون",
+                            text = "وضع الويبتون العمودي",
                             color = TextPrimaryWhite,
-                            fontSize = 15.sp,
+                            fontSize = 14.sp,
                             fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                showQuickTunePopup = false
+                                showDiagnosticsDialog = true
+                            }
+                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        Text(
+                            text = "سجل تشخيص الصفحات",
+                            color = PeriwinklePrimary,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold
                         )
                     }
 
@@ -687,15 +820,15 @@ fun MangaChapterReaderScreen(
                                 showQuickTunePopup = false
                                 onOpenReadingSettings()
                             }
-                            .padding(horizontal = 16.dp, vertical = 12.dp)
+                            .padding(horizontal = 16.dp, vertical = 10.dp)
                             .testTag("open_reading_settings_from_reader"),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.End
                     ) {
                         Text(
-                            text = "الاعدادات",
+                            text = "إعدادات القراءة الكاملة",
                             color = TextPrimaryWhite,
-                            fontSize = 15.sp,
+                            fontSize = 14.sp,
                             fontWeight = FontWeight.Bold
                         )
                     }
@@ -703,7 +836,7 @@ fun MangaChapterReaderScreen(
             }
         }
 
-        // ==================== BOTTOM READER BAR (00:41 - 00:52) ====================
+        // ==================== BOTTOM READER BAR ====================
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -722,7 +855,7 @@ fun MangaChapterReaderScreen(
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(top = 10.dp, bottom = 4.dp)
+                            .padding(top = 8.dp, bottom = 4.dp)
                     ) {
                         // Row 1: Next/Prev Chapter Circular Buttons + Dotted Page Slider
                         CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
@@ -819,7 +952,7 @@ fun MangaChapterReaderScreen(
 
                         Spacer(modifier = Modifier.height(4.dp))
 
-                        // Row 2: 5 Action Icons from Left to Right (♡, 💾, 🔖, 🔄, 🎛)
+                        // Row 2: Action Icons from Left to Right (♡ Favorite, 💾 Download/Save, 🔖 Bookmark, 🔄 Zoom, 🎛 Settings)
                         CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
                             Row(
                                 modifier = Modifier
@@ -843,22 +976,38 @@ fun MangaChapterReaderScreen(
 
                                 IconButton(
                                     onClick = {
-                                        onDownloadChapter(
-                                            work,
-                                            chapter.copy(
-                                                pageImageUrls = livePageUrls,
-                                                pageCount = effectivePageCount.coerceAtLeast(chapter.pageCount)
+                                        if (isOfflineComplete) {
+                                            onShowToast("هذا الفصل محفوظ بالكامل وجاهز للقراءة بدون إنترنت (${localPagePaths.size} صفحة)")
+                                        } else {
+                                            onDownloadChapter(
+                                                work,
+                                                chapter.copy(
+                                                    pageImageUrls = livePageUrls,
+                                                    pageCount = effectivePageCount.coerceAtLeast(chapter.pageCount)
+                                                )
                                             )
-                                        )
+                                        }
                                     },
                                     modifier = Modifier.testTag("reader_save_chapter_button")
                                 ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Save,
-                                        contentDescription = "حفظ الفصل",
-                                        tint = if (isOfflineComplete) Color(0xFF81C784) else TextPrimaryWhite,
-                                        modifier = Modifier.size(22.dp)
-                                    )
+                                    if (isActivelyDownloading) {
+                                        CircularProgressIndicator(
+                                            color = PeriwinklePrimary,
+                                            strokeWidth = 2.dp,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    } else {
+                                        Icon(
+                                            imageVector = if (isOfflineComplete) Icons.Default.CloudDone else Icons.Default.Save,
+                                            contentDescription = "حفظ الفصل",
+                                            tint = when {
+                                                isOfflineComplete -> Color(0xFF81C784)
+                                                isOfflineIncomplete -> Color(0xFFFFB74D)
+                                                else -> TextPrimaryWhite
+                                            },
+                                            modifier = Modifier.size(22.dp)
+                                        )
+                                    }
                                 }
 
                                 IconButton(
@@ -911,7 +1060,7 @@ fun MangaChapterReaderScreen(
                 }
             }
 
-            // Bottom Mini Status Strip: Time on Right, Page "١/١٢" in Center, Battery "68%" on Left
+            // Bottom Mini Status Strip: Page "١/١٢" in Center
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
                 Row(
                     modifier = Modifier
@@ -922,16 +1071,16 @@ fun MangaChapterReaderScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "68%",
-                        color = TextPrimaryWhite,
-                        fontSize = 11.sp,
+                        text = if (isOfflineComplete) "OFFLINE" else "ONLINE",
+                        color = if (isOfflineComplete) Color(0xFF81C784) else TextSecondaryGrey,
+                        fontSize = 10.sp,
                         fontWeight = FontWeight.Bold
                     )
                     if (settings.showPageNumber) {
                         val curAr = MainViewModel.toArabicDigits((currentPageIndex + 1).toString())
                         val totAr = MainViewModel.toArabicDigits(totalPages.toString())
                         Text(
-                            text = "$curAr/$totAr",
+                            text = "$curAr / $totAr",
                             color = TextPrimaryWhite,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold,
@@ -941,7 +1090,7 @@ fun MangaChapterReaderScreen(
                         Spacer(modifier = Modifier.width(1.dp))
                     }
                     Text(
-                        text = "٠٨:١٩ م",
+                        text = "الفصل ${MainViewModel.toArabicDigits(chapter.number.toString())}",
                         color = TextPrimaryWhite,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold
@@ -949,6 +1098,193 @@ fun MangaChapterReaderScreen(
                 }
             }
         }
+    }
+
+    // Chapters Switcher Modal Dialog ("قائمة الفصول")
+    if (showChaptersListSheet) {
+        AlertDialog(
+            onDismissRequest = { showChaptersListSheet = false },
+            containerColor = AppDialogSurface,
+            title = {
+                Text(
+                    text = "فصول ${work.title} (${work.chapters.size})",
+                    color = TextPrimaryWhite,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                if (work.chapters.isEmpty()) {
+                    Text("لا توجد فصول إضافية محمّلة في القائمة الحالية.", color = TextSecondaryGrey, fontSize = 13.sp)
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 380.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        items(work.chapters.sortedByDescending { it.number }, key = { it.id }) { itemChapter ->
+                            val isCurrent = itemChapter.number == chapter.number
+                            Surface(
+                                color = if (isCurrent) PeriwinklePrimary.copy(alpha = 0.2f) else Color(0xFF222632),
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        showChaptersListSheet = false
+                                        if (!isCurrent) {
+                                            onSelectChapter(itemChapter)
+                                        }
+                                    }
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = itemChapter.title,
+                                            color = if (isCurrent) PeriwinklePrimary else TextPrimaryWhite,
+                                            fontSize = 14.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        if (itemChapter.dateText.isNotBlank()) {
+                                            Text(
+                                                text = itemChapter.dateText,
+                                                color = TextSecondaryGrey,
+                                                fontSize = 11.sp
+                                            )
+                                        }
+                                    }
+                                    if (itemChapter.isDownloaded || itemChapter.downloadStatus == "COMPLETED") {
+                                        Icon(
+                                            imageVector = Icons.Default.CheckCircle,
+                                            contentDescription = "محفوظ",
+                                            tint = Color(0xFF81C784),
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showChaptersListSheet = false }) {
+                    Text("إغلاق", color = PeriwinklePrimary)
+                }
+            }
+        )
+    }
+
+    // Developer Diagnostics Log Dialog
+    if (showDiagnosticsDialog) {
+        val currentLogs = if (diagnosticLogs.isNotEmpty()) diagnosticLogs else DiagnosticLogger.logs.value
+        AlertDialog(
+            onDismissRequest = { showDiagnosticsDialog = false },
+            containerColor = AppDialogSurface,
+            title = {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("سجل التشخيص التقني", color = TextPrimaryWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text(
+                        text = "الصفحات: $effectivePageCount",
+                        color = PeriwinklePrimary,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "المصدر: ${work.siteName} • الفصل ${chapter.number} • محلي: ${localPagePaths.size} • مباشر: ${livePageUrls.size}",
+                        color = TextSecondaryGrey,
+                        fontSize = 11.sp
+                    )
+                    HorizontalDivider(color = Color(0xFF2C3140))
+                    if (currentLogs.isEmpty()) {
+                        Text(
+                            text = "لا توجد أخطاء أو أحداث مسجلة حتى الآن.",
+                            color = TextSecondaryGrey,
+                            fontSize = 12.sp
+                        )
+                    } else {
+                        LazyColumn(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 320.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            items(currentLogs, key = { it.id }) { entry ->
+                                val badgeColor = when (entry.level) {
+                                    DiagnosticLevel.ERROR -> Color(0xFFE57373)
+                                    DiagnosticLevel.WARN -> Color(0xFFFFB74D)
+                                    DiagnosticLevel.INFO -> Color(0xFF81C784)
+                                }
+                                Surface(
+                                    color = Color(0xFF1A1E29),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(modifier = Modifier.padding(8.dp)) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween
+                                        ) {
+                                            Text(
+                                                text = "[${entry.category.labelAr}] ${entry.level.labelAr}",
+                                                color = badgeColor,
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                            Text(
+                                                text = entry.formattedTime,
+                                                color = TextSecondaryGrey,
+                                                fontSize = 10.sp
+                                            )
+                                        }
+                                        Text(
+                                            text = entry.message,
+                                            color = TextPrimaryWhite,
+                                            fontSize = 12.sp
+                                        )
+                                        if (entry.url.isNotBlank()) {
+                                            Text(
+                                                text = entry.url,
+                                                color = TextSecondaryGrey,
+                                                fontSize = 10.sp,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showDiagnosticsDialog = false }) {
+                    Text("إغلاق", color = PeriwinklePrimary)
+                }
+            },
+            dismissButton = {
+                if (currentLogs.isNotEmpty()) {
+                    TextButton(onClick = onClearDiagnosticLogs) {
+                        Text("مسح السجل", color = TextSecondaryGrey)
+                    }
+                }
+            }
+        )
     }
 
     // Chapter Comments Dialog
@@ -1021,16 +1357,25 @@ fun MangaChapterReaderScreen(
             onDismissRequest = { showPagesGridDialog = false },
             containerColor = AppDialogSurface,
             title = {
-                Text("الانتقال السريع بين الصفحات", color = TextPrimaryWhite, fontWeight = FontWeight.Bold)
+                Text("الانتقال السريع بين الصفحات ($totalPages صفحة)", color = TextPrimaryWhite, fontWeight = FontWeight.Bold)
             },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        text = "${chapter.title} • اختر الصفحة للانتقال المباشر:",
-                        color = TextSecondaryGrey,
-                        fontSize = 13.sp
-                    )
-                    (1..totalPages.coerceAtMost(40)).chunked(4).forEach { rowPages ->
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 340.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    item {
+                        Text(
+                            text = "${chapter.title} • اختر رقم الصفحة للانتقال المباشر:",
+                            color = TextSecondaryGrey,
+                            fontSize = 13.sp
+                        )
+                    }
+                    val rows = (1..totalPages).chunked(4)
+                    items(rows.size) { rowIdx ->
+                        val rowPages = rows[rowIdx]
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)

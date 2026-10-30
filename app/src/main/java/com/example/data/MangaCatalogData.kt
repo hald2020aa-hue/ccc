@@ -11,10 +11,12 @@ data class MangaChapter(
     val pageImageUrls: List<String> = emptyList(),
     val localPagePaths: List<String> = emptyList(),
     val pageCount: Int = 0,
+    val downloadedPagesCount: Int = 0,
     val isDownloaded: Boolean = false,
-    val downloadStatus: String = "", // "", "QUEUED", "DOWNLOADING", "COMPLETED", "INCOMPLETE", "FAILED", "CANCELLED"
+    val downloadStatus: String = "", // "", "QUEUED", "DOWNLOADING", "PAUSED", "COMPLETED", "INCOMPLETE", "FAILED", "CANCELLED"
+    val downloadError: String = "",
     val isRead: Boolean = false,
-    val lastReadPage: Int = 0,
+    val lastReadPage: Int = -1,
     val lastReadTimeText: String = "",
     val chapterKey: String = ""
 )
@@ -37,6 +39,8 @@ data class MangaWork(
     val artist: String = "",
     val viewsText: String = "",
     val chaptersCount: Int = 0,
+    val savedChaptersCount: Int = 0,
+    val incompleteChaptersCount: Int = 0,
     val genres: List<String> = emptyList(),
     val description: String = "",
     val synopsis: String = description,
@@ -48,7 +52,10 @@ data class MangaWork(
     val storageSizeBytes: Long = 0L,
     val chapters: List<MangaChapter> = emptyList(),
     val isDetailsLoaded: Boolean = false
-)
+) {
+    val effectiveCoverUrl: String?
+        get() = coverImageUrl?.takeIf { it.isNotBlank() } ?: coverUrl?.takeIf { it.isNotBlank() }
+}
 
 object MangaCatalogData {
 

@@ -1,6 +1,7 @@
 package com.example.data.download
 
-import android.webkit.CookieManager
+import com.example.data.DiagnosticCategory
+import com.example.data.DiagnosticLogger
 import com.example.data.LiveMangaSiteScraper
 import com.example.data.MangaChapter
 import com.example.data.MangaWork
@@ -20,6 +21,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -30,27 +33,36 @@ import java.util.concurrent.TimeUnit
 /**
  * Real chapter & image DownloadManager for Android.
  * Downloads ordered chapter page images to app-private storage via LocalStorageManager,
- * tracks per-page progress and ETA, verifies file completeness before marking COMPLETED,
- * and marks partial downloads as INCOMPLETE so missing pages are never hidden.
+ * reuses already-downloaded valid pages on retry, updates real Android notifications via
+ * DownloadNotificationHelper, tracks per-page progress and ETA, verifies file completeness
+ * before marking COMPLETED, and marks partial downloads as INCOMPLETE so missing pages are never hidden.
  */
 class MangaDownloadManager(
     private val dao: AppDao,
     private val storageManager: LocalStorageManager,
+    private val notificationHelper: DownloadNotificationHelper? = null,
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
         .build()
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    // Bounded concurrency so multiple chapter downloads queue cleanly without overwhelming the device/site
+    private val chapterQueueSemaphore = Semaphore(2)
+
     private val activeJobs = ConcurrentHashMap<Long, Job>()
+    private val activeChapterKeys = ConcurrentHashMap.newKeySet<String>()
     private val cancelledTaskIds = ConcurrentHashMap.newKeySet<Long>()
     private val pausedTaskIds = ConcurrentHashMap.newKeySet<Long>()
 
     private val _isAllPaused = MutableStateFlow(false)
     val isAllPaused: StateFlow<Boolean> = _isAllPaused.asStateFlow()
+
+    fun isChapterActivelyDownloading(chapterKey: String): Boolean =
+        activeChapterKeys.contains(chapterKey)
 
     fun enqueueChaptersDownload(
         work: MangaWork,
@@ -60,7 +72,7 @@ class MangaDownloadManager(
     ) {
         if (chapters.isEmpty()) return
         scope.launch {
-            val localCoverPath = downloadAndSaveWorkCover(work)
+            val localCoverPath = ensureLocalWorkCover(work)
             val existingWork = dao.getDownloadedWorkById(work.id)
             val totalSiteChapters = maxOf(
                 work.chaptersCount,
@@ -68,7 +80,7 @@ class MangaDownloadManager(
                 existingWork?.totalChaptersOnSite ?: 0,
                 chapters.size
             )
-            val effectiveCoverUrl = (work.coverImageUrl ?: work.coverUrl ?: existingWork?.remoteCoverUrl).orEmpty()
+            val effectiveCoverUrl = (work.effectiveCoverUrl ?: existingWork?.remoteCoverUrl).orEmpty()
 
             val workEntity = DownloadedWorkEntity(
                 workId = work.id,
@@ -98,7 +110,38 @@ class MangaDownloadManager(
 
             for (chapter in chapters) {
                 val chapterKey = chapter.chapterKey.ifBlank { "${work.id}_ch_${chapter.number}" }
+
+                // Prevent duplicate simultaneous downloads for the same chapter
+                if (!activeChapterKeys.add(chapterKey)) {
+                    DiagnosticLogger.logInfo(
+                        category = DiagnosticCategory.DOWNLOAD,
+                        message = "تم تخطي إضافة الفصل ${chapter.number} لأنه قيد التنزيل بالفعل",
+                        workId = work.id,
+                        chapterId = chapter.id
+                    )
+                    continue
+                }
+
+                // Check if already completely downloaded and valid on disk
+                val existingChapter = dao.getDownloadedChapterByKey(chapterKey)
+                if (existingChapter != null && existingChapter.status == STATUS_COMPLETED) {
+                    val existingPaths = storageManager.decodeLocalPathsJson(existingChapter.localPagesJson)
+                    if (storageManager.verifyChapterFilesComplete(existingChapter.pageCount, existingPaths)) {
+                        activeChapterKeys.remove(chapterKey)
+                        DiagnosticLogger.logInfo(
+                            category = DiagnosticCategory.DOWNLOAD,
+                            message = "الفصل ${chapter.number} محفوظ ومكتمل مسبقًا (${existingPaths.size} صفحة)",
+                            workId = work.id,
+                            chapterId = chapter.id
+                        )
+                        continue
+                    }
+                }
+
                 val expectedCount = chapter.pageImageUrls.size.coerceAtLeast(chapter.pageCount).coerceAtLeast(1)
+                val previouslySavedPaths = existingChapter?.let {
+                    storageManager.filterExistingValidPagePaths(storageManager.decodeLocalPathsJson(it.localPagesJson))
+                }.orEmpty()
 
                 val initialChapterEntity = DownloadedChapterEntity(
                     chapterKey = chapterKey,
@@ -112,11 +155,11 @@ class MangaDownloadManager(
                     chapterUrl = chapter.chapterUrl,
                     dateText = chapter.dateText,
                     pageCount = expectedCount,
-                    downloadedPagesCount = 0,
-                    localPagesJson = "[]",
-                    totalBytes = 0L,
+                    downloadedPagesCount = previouslySavedPaths.size,
+                    localPagesJson = storageManager.encodeLocalPathsJson(previouslySavedPaths),
+                    totalBytes = existingChapter?.totalBytes ?: 0L,
                     status = if (_isAllPaused.value) STATUS_PAUSED else STATUS_QUEUED,
-                    progressPercent = 0f,
+                    progressPercent = if (expectedCount > 0) ((previouslySavedPaths.size * 100f) / expectedCount) else 0f,
                     etaSeconds = 18
                 )
                 dao.upsertDownloadedChapter(initialChapterEntity)
@@ -125,11 +168,11 @@ class MangaDownloadManager(
                 val taskEntity = DownloadTaskEntity(
                     title = work.title,
                     url = chapter.chapterUrl.ifBlank { "manga://${work.id}/chapter/${chapter.number}" },
-                    status = if (_isAllPaused.value) STATUS_PAUSED else STATUS_DOWNLOADING,
-                    progress = 0,
-                    bytesDownloaded = 0L,
-                    totalBytes = 0L,
-                    localPath = "",
+                    status = if (_isAllPaused.value) STATUS_PAUSED else STATUS_QUEUED,
+                    progress = initialChapterEntity.progressPercent.toInt(),
+                    bytesDownloaded = existingChapter?.totalBytes ?: 0L,
+                    totalBytes = existingChapter?.totalBytes ?: 0L,
+                    localPath = previouslySavedPaths.firstOrNull().orEmpty(),
                     workId = work.id,
                     chapterKey = chapterKey,
                     chapterId = chapter.id,
@@ -137,21 +180,27 @@ class MangaDownloadManager(
                     sourceName = work.siteName,
                     coverPath = coverForTask,
                     coverUrl = coverForTask,
-                    downloadedPages = 0,
+                    downloadedPages = previouslySavedPaths.size,
                     totalPages = expectedCount,
                     etaSeconds = 18,
                     chaptersCount = 1
                 )
                 val taskId = dao.insertDownloadTask(taskEntity)
                 val job = scope.launch {
-                    executeChapterDownloadJob(
-                        taskId = taskId,
-                        work = work,
-                        chapter = chapter,
-                        chapterKey = chapterKey,
-                        localCoverPath = coverForTask,
-                        site = site
-                    )
+                    try {
+                        chapterQueueSemaphore.withPermit {
+                            executeChapterDownloadJob(
+                                taskId = taskId,
+                                work = work,
+                                chapter = chapter,
+                                chapterKey = chapterKey,
+                                localCoverPath = coverForTask,
+                                site = site
+                            )
+                        }
+                    } finally {
+                        activeChapterKeys.remove(chapterKey)
+                    }
                 }
                 activeJobs[taskId] = job
             }
@@ -167,9 +216,9 @@ class MangaDownloadManager(
         chapter: MangaChapter,
         site: SiteEntity? = null
     ): DownloadedChapterEntity = withContext(Dispatchers.IO) {
-        val localCoverPath = downloadAndSaveWorkCover(work)
+        val localCoverPath = ensureLocalWorkCover(work)
         val existingWork = dao.getDownloadedWorkById(work.id)
-        val effectiveCoverUrl = (work.coverImageUrl ?: work.coverUrl ?: existingWork?.remoteCoverUrl).orEmpty()
+        val effectiveCoverUrl = (work.effectiveCoverUrl ?: existingWork?.remoteCoverUrl).orEmpty()
 
         val workEntity = DownloadedWorkEntity(
             workId = work.id,
@@ -219,14 +268,19 @@ class MangaDownloadManager(
             chaptersCount = 1
         )
         val taskId = dao.insertDownloadTask(taskEntity)
-        executeChapterDownloadJob(
-            taskId = taskId,
-            work = work,
-            chapter = chapter,
-            chapterKey = chapterKey,
-            localCoverPath = coverForTask,
-            site = site
-        )
+        activeChapterKeys.add(chapterKey)
+        try {
+            executeChapterDownloadJob(
+                taskId = taskId,
+                work = work,
+                chapter = chapter,
+                chapterKey = chapterKey,
+                localCoverPath = coverForTask,
+                site = site
+            )
+        } finally {
+            activeChapterKeys.remove(chapterKey)
+        }
         dao.getDownloadedChapterByKey(chapterKey) ?: error("Chapter record missing after download")
     }
 
@@ -238,19 +292,39 @@ class MangaDownloadManager(
         localCoverPath: String,
         site: SiteEntity?
     ) {
+        val taskKeyStr = "${work.id}_${chapter.number}"
         try {
             while (_isAllPaused.value || pausedTaskIds.contains(taskId)) {
                 if (cancelledTaskIds.contains(taskId)) break
                 delay(250)
             }
             if (cancelledTaskIds.contains(taskId)) {
-                markCancelled(taskId, work, chapter, chapterKey, localCoverPath)
+                markCancelled(taskId, taskKeyStr, work, chapter, chapterKey, localCoverPath)
                 return
             }
 
-            // 1. Resolve chapter page URLs
+            notificationHelper?.showDownloadStarting(
+                taskId = taskKeyStr,
+                workId = work.id,
+                workTitle = work.title,
+                chapterNumber = chapter.number
+            )
+
+            DiagnosticLogger.logInfo(
+                category = DiagnosticCategory.DOWNLOAD,
+                message = "بدء تنزيل الفصل ${chapter.number} (${work.title})",
+                sourceId = work.sourceId.toString(),
+                sourceName = work.siteName,
+                workId = work.id,
+                chapterId = chapter.id,
+                url = chapter.chapterUrl
+            )
+
+            // 1. Resolve chapter page URLs strictly (never fake offline URLs when chapterUrl is http/https!)
             val resolvedPageUrls: List<String> = when {
-                chapter.pageImageUrls.isNotEmpty() -> chapter.pageImageUrls
+                chapter.pageImageUrls.isNotEmpty() -> {
+                    LinkedHashSet(chapter.pageImageUrls.filter { it.isNotBlank() }).toList()
+                }
                 chapter.chapterUrl.startsWith("http://") || chapter.chapterUrl.startsWith("https://") -> {
                     val adapter = if (site != null) {
                         MangaSourceAdapterRegistry.getAdapterForSite(site)
@@ -260,6 +334,7 @@ class MangaDownloadManager(
                     if (!adapter.capabilities.supportsOfflineDownload) {
                         markFailed(
                             taskId = taskId,
+                            taskKeyStr = taskKeyStr,
                             work = work,
                             chapter = chapter,
                             chapterKey = chapterKey,
@@ -273,21 +348,45 @@ class MangaDownloadManager(
                         work = work,
                         chapter = chapter
                     )
-                    pageResult.data.ifEmpty {
-                        // Fallback for offline/synthetic URLs when site is unreachable in test environments
-                        val fallbackCount = chapter.pageCount.coerceAtLeast(3)
-                        (1..fallbackCount).map { idx -> "offline://${work.id}/${chapter.number}/page_$idx.jpg" }
+                    if (pageResult.data.isEmpty()) {
+                        val reason = pageResult.errorMessage ?: if (pageResult.requiresCloudflareChallenge) {
+                            "يتطلب المصدر فتح الصفحة في المتصفح المدمج لتجاوز حماية Cloudflare أولاً"
+                        } else {
+                            "تعذر استخراج روابط صور الفصل من صفحة المصدر"
+                        }
+                        DiagnosticLogger.logError(
+                            category = DiagnosticCategory.DOWNLOAD,
+                            message = "فشل استخراج روابط صور الفصل ${chapter.number}: $reason",
+                            sourceId = work.sourceId.toString(),
+                            sourceName = work.siteName,
+                            workId = work.id,
+                            chapterId = chapter.id,
+                            url = chapter.chapterUrl
+                        )
+                        markFailed(
+                            taskId = taskId,
+                            taskKeyStr = taskKeyStr,
+                            work = work,
+                            chapter = chapter,
+                            chapterKey = chapterKey,
+                            localCoverPath = localCoverPath,
+                            errorMsg = reason
+                        )
+                        return
                     }
+                    LinkedHashSet(pageResult.data.filter { it.isNotBlank() }).toList()
                 }
-                else -> {
+                chapter.chapterUrl.startsWith("offline://") || chapter.chapterUrl.startsWith("test://") || chapter.chapterUrl.isBlank() -> {
                     val fallbackCount = chapter.pageCount.coerceAtLeast(3)
                     (1..fallbackCount).map { idx -> "offline://${work.id}/${chapter.number}/page_$idx.jpg" }
                 }
+                else -> emptyList()
             }
 
             if (resolvedPageUrls.isEmpty()) {
                 markFailed(
                     taskId = taskId,
+                    taskKeyStr = taskKeyStr,
                     work = work,
                     chapter = chapter,
                     chapterKey = chapterKey,
@@ -299,8 +398,17 @@ class MangaDownloadManager(
 
             val expectedPages = resolvedPageUrls.size
             val savedLocalPaths = mutableListOf<String>()
+            val failedPageNumbers = mutableListOf<Int>()
             var cumulativeBytes = 0L
-            var anyPageFailed = false
+
+            notificationHelper?.showDownloadProgress(
+                taskId = taskKeyStr,
+                workId = work.id,
+                workTitle = work.title,
+                chapterNumber = chapter.number,
+                downloadedPages = 0,
+                totalPages = expectedPages
+            )
 
             for ((index, pageUrl) in resolvedPageUrls.withIndex()) {
                 while (_isAllPaused.value || pausedTaskIds.contains(taskId)) {
@@ -309,13 +417,14 @@ class MangaDownloadManager(
                 }
                 if (cancelledTaskIds.contains(taskId)) {
                     storageManager.deleteChapterFiles(work.sourceId, work.id, chapterKey, savedLocalPaths)
-                    markCancelled(taskId, work, chapter, chapterKey, localCoverPath)
+                    markCancelled(taskId, taskKeyStr, work, chapter, chapterKey, localCoverPath)
                     return
                 }
 
+                val pageNum = index + 1
                 val remainingPages = (expectedPages - index).coerceAtLeast(1)
                 val etaSec = (remainingPages * 2).coerceAtLeast(1)
-                val progressFloat = ((index.toFloat() / expectedPages.toFloat()) * 100f).coerceIn(0f, 99f)
+                val progressFloat = ((savedLocalPaths.size.toFloat() / expectedPages.toFloat()) * 100f).coerceIn(0f, 99f)
 
                 updateProgressInDb(
                     taskId = taskId,
@@ -324,23 +433,47 @@ class MangaDownloadManager(
                     chapterKey = chapterKey,
                     localCoverPath = localCoverPath,
                     expectedPages = expectedPages,
-                    downloadedCount = index,
+                    downloadedCount = savedLocalPaths.size,
                     localPaths = savedLocalPaths,
                     bytesSoFar = cumulativeBytes,
                     progressFloat = progressFloat,
                     etaSeconds = etaSec
                 )
 
-                val pageBytes = downloadSingleImageBytes(
+                // Check if this page was already downloaded and is valid on disk (resumable retry)
+                val existingValidFile = storageManager.getExistingValidPageFile(
+                    sourceId = work.sourceId,
+                    workId = work.id,
+                    chapterKey = chapterKey,
+                    pageIndex = index
+                )
+                if (existingValidFile != null) {
+                    savedLocalPaths.add(existingValidFile.absolutePath)
+                    cumulativeBytes += existingValidFile.length()
+                    notificationHelper?.showDownloadProgress(
+                        taskId = taskKeyStr,
+                        workId = work.id,
+                        workTitle = work.title,
+                        chapterNumber = chapter.number,
+                        downloadedPages = savedLocalPaths.size,
+                        totalPages = expectedPages
+                    )
+                    continue
+                }
+
+                val pageBytes = downloadSingleImageBytesWithRetry(
                     imageUrl = pageUrl,
-                    refererUrl = chapter.chapterUrl.ifBlank { work.siteUrl },
+                    refererUrl = chapter.chapterUrl.ifBlank { work.mangaUrl.ifBlank { work.siteUrl } },
+                    siteUrl = work.siteUrl,
+                    workId = work.id,
+                    chapterId = chapter.id,
                     workTitle = work.title,
                     chapterTitle = chapter.title,
-                    pageNumber = index + 1
+                    pageNumber = pageNum
                 )
 
                 if (pageBytes != null && storageManager.isValidImageBytes(pageBytes)) {
-                    val ext = guessImageExtension(pageUrl)
+                    val ext = guessImageExtension(pageUrl, pageBytes)
                     val savedFile = storageManager.saveChapterPageImage(
                         sourceId = work.sourceId,
                         workId = work.id,
@@ -349,19 +482,35 @@ class MangaDownloadManager(
                         bytes = pageBytes,
                         extension = ext
                     )
-                    if (savedFile.exists() && savedFile.length() >= 64L) {
+                    if (storageManager.isValidImageFile(savedFile)) {
                         savedLocalPaths.add(savedFile.absolutePath)
                         cumulativeBytes += savedFile.length()
+                        notificationHelper?.showDownloadProgress(
+                            taskId = taskKeyStr,
+                            workId = work.id,
+                            workTitle = work.title,
+                            chapterNumber = chapter.number,
+                            downloadedPages = savedLocalPaths.size,
+                            totalPages = expectedPages
+                        )
                     } else {
-                        anyPageFailed = true
+                        failedPageNumbers.add(pageNum)
+                        DiagnosticLogger.logError(
+                            category = DiagnosticCategory.STORAGE,
+                            message = "فشل التحقق من ملف الصفحة $pageNum بعد الحفظ",
+                            workId = work.id,
+                            chapterId = chapter.id,
+                            pageNumber = pageNum,
+                            url = pageUrl
+                        )
                     }
                 } else {
-                    anyPageFailed = true
+                    failedPageNumbers.add(pageNum)
                 }
             }
 
             // Strictly verify every single required page exists on disk before marking COMPLETED
-            val isComplete = !anyPageFailed &&
+            val isComplete = failedPageNumbers.isEmpty() &&
                 storageManager.verifyChapterFilesComplete(expectedPages, savedLocalPaths)
 
             val finalStatus = when {
@@ -370,9 +519,13 @@ class MangaDownloadManager(
                 else -> STATUS_FAILED
             }
             val finalProgress = if (isComplete) 100f else ((savedLocalPaths.size.toFloat() / expectedPages) * 100f)
+            val failedPagesSummary = if (failedPageNumbers.isNotEmpty()) {
+                "فشل تحميل الصفحات: ${failedPageNumbers.take(8).joinToString("، ")}" +
+                    if (failedPageNumbers.size > 8) " وغيرها" else ""
+            } else ""
             val finalError = when (finalStatus) {
-                STATUS_INCOMPLETE -> "فصل غير مكتمل (${savedLocalPaths.size}/$expectedPages صفحة)"
-                STATUS_FAILED -> "تعذر تنزيل صور الفصل"
+                STATUS_INCOMPLETE -> "فصل غير مكتمل (${savedLocalPaths.size} من $expectedPages صفحة) — $failedPagesSummary"
+                STATUS_FAILED -> if (failedPagesSummary.isNotBlank()) "تعذر تنزيل صور الفصل ($failedPagesSummary)" else "تعذر تنزيل صور الفصل"
                 else -> null
             }
 
@@ -425,9 +578,60 @@ class MangaDownloadManager(
             )
 
             refreshWorkStorageSummary(work.id, work.sourceId)
+
+            when (finalStatus) {
+                STATUS_COMPLETED -> {
+                    DiagnosticLogger.logInfo(
+                        category = DiagnosticCategory.DOWNLOAD,
+                        message = "اكتمل تنزيل الفصل ${chapter.number} بنجاح ($expectedPages صفحة)",
+                        workId = work.id,
+                        chapterId = chapter.id
+                    )
+                    notificationHelper?.showDownloadCompleted(
+                        taskId = taskKeyStr,
+                        workId = work.id,
+                        workTitle = work.title,
+                        chapterNumber = chapter.number,
+                        totalPages = expectedPages
+                    )
+                }
+                STATUS_INCOMPLETE -> {
+                    DiagnosticLogger.logWarn(
+                        category = DiagnosticCategory.DOWNLOAD,
+                        message = finalError ?: "فصل غير مكتمل",
+                        workId = work.id,
+                        chapterId = chapter.id
+                    )
+                    notificationHelper?.showDownloadFailed(
+                        taskId = taskKeyStr,
+                        workId = work.id,
+                        workTitle = work.title,
+                        chapterNumber = chapter.number,
+                        reason = finalError ?: "فصل غير مكتمل",
+                        isIncomplete = true
+                    )
+                }
+                else -> {
+                    DiagnosticLogger.logError(
+                        category = DiagnosticCategory.DOWNLOAD,
+                        message = finalError ?: "فشل تنزيل الفصل",
+                        workId = work.id,
+                        chapterId = chapter.id
+                    )
+                    notificationHelper?.showDownloadFailed(
+                        taskId = taskKeyStr,
+                        workId = work.id,
+                        workTitle = work.title,
+                        chapterNumber = chapter.number,
+                        reason = finalError ?: "تعذر تنزيل الفصل",
+                        isIncomplete = false
+                    )
+                }
+            }
         } catch (e: Exception) {
             markFailed(
                 taskId = taskId,
+                taskKeyStr = taskKeyStr,
                 work = work,
                 chapter = chapter,
                 chapterKey = chapterKey,
@@ -500,11 +704,13 @@ class MangaDownloadManager(
 
     private suspend fun markCancelled(
         taskId: Long,
+        taskKeyStr: String,
         work: MangaWork,
         chapter: MangaChapter,
         chapterKey: String,
         localCoverPath: String
     ) {
+        notificationHelper?.cancelNotification(taskKeyStr)
         dao.upsertDownloadedChapter(
             DownloadedChapterEntity(
                 chapterKey = chapterKey,
@@ -524,7 +730,7 @@ class MangaDownloadManager(
                 status = STATUS_CANCELLED,
                 progressPercent = 0f,
                 etaSeconds = 0,
-                errorMessage = "ألغيت"
+                errorMessage = "تم الإلغاء"
             )
         )
         dao.updateDownloadTask(
@@ -541,7 +747,7 @@ class MangaDownloadManager(
                 sourceName = work.siteName,
                 coverPath = localCoverPath,
                 coverUrl = localCoverPath,
-                errorMessage = "ألغيت"
+                errorMessage = "تم الإلغاء"
             )
         )
         refreshWorkStorageSummary(work.id, work.sourceId)
@@ -549,12 +755,21 @@ class MangaDownloadManager(
 
     private suspend fun markFailed(
         taskId: Long,
+        taskKeyStr: String,
         work: MangaWork,
         chapter: MangaChapter,
         chapterKey: String,
         localCoverPath: String,
         errorMsg: String
     ) {
+        notificationHelper?.showDownloadFailed(
+            taskId = taskKeyStr,
+            workId = work.id,
+            workTitle = work.title,
+            chapterNumber = chapter.number,
+            reason = errorMsg,
+            isIncomplete = false
+        )
         dao.upsertDownloadedChapter(
             DownloadedChapterEntity(
                 chapterKey = chapterKey,
@@ -596,34 +811,128 @@ class MangaDownloadManager(
         )
     }
 
-    private suspend fun downloadAndSaveWorkCover(work: MangaWork): String = withContext(Dispatchers.IO) {
-        if (work.localCoverPath.isNotBlank() && File(work.localCoverPath).exists()) {
-            return@withContext work.localCoverPath
+    /**
+     * Checks if a valid local cover already exists for this work; if not, downloads the remote cover
+     * with site headers/cookies, validates the image bytes, and saves `cover.jpg` locally.
+     * If cover download fails, chapter download continues without failing.
+     */
+    suspend fun ensureLocalWorkCover(work: MangaWork): String = withContext(Dispatchers.IO) {
+        try {
+            // 1. Check work.localCoverPath
+            if (storageManager.hasValidLocalCover(work.localCoverPath)) {
+                return@withContext work.localCoverPath
+            }
+            // 2. Check existing DB record or work directory
+            val existingDbCover = dao.getDownloadedWorkById(work.id)?.localCoverPath.orEmpty()
+            if (storageManager.hasValidLocalCover(existingDbCover)) {
+                return@withContext existingDbCover
+            }
+            val existingFile = storageManager.getExistingValidCoverFile(work.sourceId, work.id)
+            if (existingFile != null) {
+                return@withContext existingFile.absolutePath
+            }
+
+            // 3. Download remote cover URL
+            val coverUrl = work.effectiveCoverUrl ?: dao.getDownloadedWorkById(work.id)?.remoteCoverUrl
+            if (!coverUrl.isNullOrBlank()) {
+                val bytes = downloadSingleImageBytesWithRetry(
+                    imageUrl = coverUrl,
+                    refererUrl = work.mangaUrl.ifBlank { work.siteUrl },
+                    siteUrl = work.siteUrl,
+                    workId = work.id,
+                    chapterId = "cover",
+                    workTitle = work.title,
+                    chapterTitle = "Cover",
+                    pageNumber = 0
+                )
+                if (bytes != null && storageManager.isValidImageBytes(bytes)) {
+                    val savedFile = storageManager.saveCoverImage(
+                        sourceId = work.sourceId,
+                        workId = work.id,
+                        bytes = bytes,
+                        allowSyntheticFallback = false
+                    )
+                    if (storageManager.isValidImageFile(savedFile)) {
+                        DiagnosticLogger.logInfo(
+                            category = DiagnosticCategory.COVER,
+                            message = "تم حفظ غلاف المانجا محليًا بنجاح (${work.title})",
+                            workId = work.id,
+                            url = coverUrl
+                        )
+                        return@withContext savedFile.absolutePath
+                    }
+                } else {
+                    DiagnosticLogger.logWarn(
+                        category = DiagnosticCategory.COVER,
+                        message = "تعذر تحميل غلاف المانجا (${work.title}) — سيستمر تنزيل الفصل بشكل طبيعي",
+                        workId = work.id,
+                        url = coverUrl
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            DiagnosticLogger.logWarn(
+                category = DiagnosticCategory.COVER,
+                message = "خطأ غير حرج أثناء حفظ الغلاف: ${e.localizedMessage}",
+                workId = work.id
+            )
         }
-        val coverUrl = work.coverImageUrl ?: work.coverUrl
-        val bytes = if (!coverUrl.isNullOrBlank()) {
-            downloadSingleImageBytes(
-                imageUrl = coverUrl,
-                refererUrl = work.siteUrl,
-                workTitle = work.title,
-                chapterTitle = "Cover",
-                pageNumber = 0
-            ) ?: ByteArray(0)
-        } else {
-            ByteArray(0)
+        ""
+    }
+
+    private suspend fun downloadSingleImageBytesWithRetry(
+        imageUrl: String,
+        refererUrl: String,
+        siteUrl: String,
+        workId: String,
+        chapterId: String,
+        workTitle: String,
+        chapterTitle: String,
+        pageNumber: Int
+    ): ByteArray? {
+        for (attempt in 1..2) {
+            val bytes = downloadSingleImageBytes(
+                imageUrl = imageUrl,
+                refererUrl = refererUrl,
+                siteUrl = siteUrl,
+                workId = workId,
+                chapterId = chapterId,
+                workTitle = workTitle,
+                chapterTitle = chapterTitle,
+                pageNumber = pageNumber,
+                attempt = attempt
+            )
+            if (bytes != null && storageManager.isValidImageBytes(bytes)) {
+                return bytes
+            }
+            if (attempt == 1 && (imageUrl.startsWith("http://") || imageUrl.startsWith("https://"))) {
+                delay(350)
+            }
         }
-        storageManager.saveCoverImage(work.sourceId, work.id, bytes).absolutePath
+        return null
     }
 
     private fun downloadSingleImageBytes(
         imageUrl: String,
         refererUrl: String,
+        siteUrl: String,
+        workId: String,
+        chapterId: String,
         workTitle: String,
         chapterTitle: String,
-        pageNumber: Int
+        pageNumber: Int,
+        attempt: Int
     ): ByteArray? {
         if (imageUrl.startsWith("offline://") || imageUrl.startsWith("test://")) {
             if (imageUrl.contains("fail") || imageUrl.contains("missing")) {
+                DiagnosticLogger.logError(
+                    category = DiagnosticCategory.DOWNLOAD,
+                    message = "فشل تحميل الصفحة $pageNumber (رابط اختبار فاشل)",
+                    workId = workId,
+                    chapterId = chapterId,
+                    pageNumber = pageNumber,
+                    url = imageUrl
+                )
                 return null
             }
             return storageManager.generateValidJpegBytes(
@@ -641,33 +950,81 @@ class MangaDownloadManager(
         }
 
         return try {
+            val cleanUrl = imageUrl.trim()
+            val effectiveReferer = refererUrl.ifBlank { siteUrl }.trim()
             val builder = Request.Builder()
-                .url(imageUrl)
+                .url(cleanUrl)
                 .header("User-Agent", LiveMangaSiteScraper.DEFAULT_USER_AGENT)
-                .header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
-            if (refererUrl.isNotBlank()) {
-                builder.header("Referer", refererUrl)
+                .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                .header("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
+
+            if (effectiveReferer.isNotBlank()) {
+                builder.header("Referer", effectiveReferer)
             }
-            try {
-                val cookie = CookieManager.getInstance()?.getCookie(imageUrl)
-                    ?: CookieManager.getInstance()?.getCookie(refererUrl)
-                if (!cookie.isNullOrBlank()) {
-                    builder.header("Cookie", cookie)
-                }
-            } catch (_: Throwable) {
+
+            val combinedCookies = LiveMangaSiteScraper.getCombinedCookies(
+                targetUrl = cleanUrl,
+                refererUrl = effectiveReferer,
+                siteUrl = siteUrl
+            )
+            if (combinedCookies.isNotBlank()) {
+                builder.header("Cookie", combinedCookies)
             }
 
             httpClient.newCall(builder.build()).execute().use { response ->
-                if (!response.isSuccessful) return null
+                val code = response.code
+                if (!response.isSuccessful) {
+                    DiagnosticLogger.logError(
+                        category = DiagnosticCategory.NETWORK,
+                        message = "فشل طلب الصورة (المحاولة $attempt) رمز HTTP $code",
+                        workId = workId,
+                        chapterId = chapterId,
+                        pageNumber = if (pageNumber > 0) pageNumber else null,
+                        url = cleanUrl,
+                        httpCode = code
+                    )
+                    return null
+                }
                 val bodyBytes = response.body?.bytes() ?: return null
-                if (storageManager.isValidImageBytes(bodyBytes)) bodyBytes else null
+                if (storageManager.isValidImageBytes(bodyBytes)) {
+                    bodyBytes
+                } else {
+                    DiagnosticLogger.logError(
+                        category = DiagnosticCategory.DOWNLOAD,
+                        message = "استجابة غير صالحة للصورة (ليست ملف صورة حقيقي أو صفحة حماية HTML، الحجم=${bodyBytes.size} بايت)",
+                        workId = workId,
+                        chapterId = chapterId,
+                        pageNumber = if (pageNumber > 0) pageNumber else null,
+                        url = cleanUrl,
+                        httpCode = code
+                    )
+                    null
+                }
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            DiagnosticLogger.logError(
+                category = DiagnosticCategory.NETWORK,
+                message = "خطأ شبكة أثناء تحميل الصفحة $pageNumber: ${e.localizedMessage}",
+                workId = workId,
+                chapterId = chapterId,
+                pageNumber = if (pageNumber > 0) pageNumber else null,
+                url = imageUrl
+            )
             null
         }
     }
 
-    private fun guessImageExtension(url: String): String {
+    private fun guessImageExtension(url: String, bytes: ByteArray): String {
+        if (bytes.size >= 4) {
+            val b0 = bytes[0].toInt() and 0xFF
+            val b1 = bytes[1].toInt() and 0xFF
+            val b2 = bytes[2].toInt() and 0xFF
+            val b3 = bytes[3].toInt() and 0xFF
+            if (b0 == 0x89 && b1 == 0x50 && b2 == 0x4E && b3 == 0x47) return "png"
+            if (b0 == 0x52 && b1 == 0x49 && b2 == 0x46 && b3 == 0x46) return "webp"
+            if (b0 == 0x47 && b1 == 0x49 && b2 == 0x46 && b3 == 0x38) return "gif"
+            if (b0 == 0xFF && b1 == 0xD8 && b2 == 0xFF) return "jpg"
+        }
         val clean = url.substringBefore("?").lowercase()
         return when {
             clean.endsWith(".png") -> "png"
@@ -680,12 +1037,18 @@ class MangaDownloadManager(
     suspend fun refreshWorkStorageSummary(workId: String, sourceId: Long) = withContext(Dispatchers.IO) {
         val existingWork = dao.getDownloadedWorkById(workId) ?: return@withContext
         val chapters = dao.getDownloadedChaptersForWorkOnce(workId)
-        val completedChapters = chapters.count { it.status == STATUS_COMPLETED }
+        val completedChapters = chapters.count { ch ->
+            ch.status == STATUS_COMPLETED &&
+                storageManager.verifyChapterFilesComplete(ch.pageCount, storageManager.decodeLocalPathsJson(ch.localPagesJson))
+        }
         val storageBytes = storageManager.getWorkStorageBytes(sourceId, workId)
             .coerceAtLeast(chapters.sumOf { it.totalBytes })
+        val verifiedCover = existingWork.localCoverPath.takeIf { storageManager.hasValidLocalCover(it) }
+            ?: storageManager.getExistingValidCoverFile(sourceId, workId)?.absolutePath.orEmpty()
 
         dao.upsertDownloadedWork(
             existingWork.copy(
+                localCoverPath = verifiedCover,
                 savedChaptersCount = completedChapters,
                 totalStorageBytes = storageBytes,
                 updatedAt = System.currentTimeMillis()
@@ -726,6 +1089,10 @@ class MangaDownloadManager(
     fun cancelSingleTask(task: DownloadTaskEntity) {
         cancelledTaskIds.add(task.id)
         activeJobs[task.id]?.cancel()
+        if (task.chapterKey.isNotBlank()) {
+            activeChapterKeys.remove(task.chapterKey)
+        }
+        notificationHelper?.cancelNotification("${task.workId}_${task.chapterNumber}")
         scope.launch {
             if (task.chapterKey.isNotBlank()) {
                 val ch = dao.getDownloadedChapterByKey(task.chapterKey)
@@ -735,7 +1102,7 @@ class MangaDownloadManager(
                     dao.upsertDownloadedChapter(ch.copy(status = STATUS_CANCELLED, progressPercent = 0f, localPagesJson = "[]"))
                 }
             }
-            dao.updateDownloadTask(task.copy(status = STATUS_CANCELLED, progress = 0, errorMessage = "ألغيت"))
+            dao.updateDownloadTask(task.copy(status = STATUS_CANCELLED, progress = 0, errorMessage = "تم الإلغاء"))
         }
     }
 
@@ -762,6 +1129,7 @@ class MangaDownloadManager(
     fun clearFinishedDownloadRecords() = clearCompletedAndCancelledTasks()
 
     suspend fun deleteDownloadedChapterAndFiles(chapterKey: String) = withContext(Dispatchers.IO) {
+        activeChapterKeys.remove(chapterKey)
         val ch = dao.getDownloadedChapterByKey(chapterKey) ?: return@withContext
         val paths = storageManager.decodeLocalPathsJson(ch.localPagesJson)
         storageManager.deleteChapterFiles(ch.sourceId, ch.workId, ch.chapterKey, paths)
@@ -787,6 +1155,7 @@ class MangaDownloadManager(
         cancelledTaskIds.add(task.id)
         activeJobs[task.id]?.cancel()
         if (task.chapterKey.isNotBlank()) {
+            activeChapterKeys.remove(task.chapterKey)
             deleteDownloadedChapterAndFiles(task.chapterKey)
         }
         dao.deleteDownloadTask(task)

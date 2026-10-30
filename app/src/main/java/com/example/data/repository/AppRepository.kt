@@ -9,6 +9,7 @@ import android.os.StatFs
 import android.provider.OpenableColumns
 import com.example.data.MangaChapter
 import com.example.data.MangaWork
+import com.example.data.download.DownloadNotificationHelper
 import com.example.data.download.MangaDownloadManager
 import com.example.data.local.AppDao
 import com.example.data.local.DownloadTaskEntity
@@ -67,9 +68,10 @@ class AppRepository(
         .build()
 
     val localStorageManager = LocalStorageManager(context)
+    val notificationHelper = DownloadNotificationHelper(context)
     val sourceRepository = SourceRepository(dao, httpClient)
     val readingProgressRepository = ReadingProgressRepository(dao)
-    val mangaDownloadManager = MangaDownloadManager(dao, localStorageManager, httpClient)
+    val mangaDownloadManager = MangaDownloadManager(dao, localStorageManager, notificationHelper, httpClient)
 
     val allSites: Flow<List<SiteEntity>> = dao.getAllSites()
     val enabledSites: Flow<List<SiteEntity>> = dao.getEnabledSites()
@@ -337,8 +339,19 @@ class AppRepository(
         val progressList = dao.getReadingProgressForWorkOnce(entity.workId)
         val progressByKey = progressList.associateBy { it.chapterKey }
 
-        val chapters = downloadedChList.sortedByDescending { it.chapterNumber }.map { chEntity ->
-            val localPaths = localStorageManager.decodeLocalPathsJson(chEntity.localPagePathsJson)
+        val chapters = downloadedChList.sortedBy { it.chapterNumber }.map { chEntity ->
+            val rawPaths = localStorageManager.decodeLocalPathsJson(chEntity.localPagePathsJson)
+            val validLocalPaths = localStorageManager.filterExistingValidPagePaths(rawPaths)
+            val expectedPages = chEntity.totalPages.coerceAtLeast(rawPaths.size).coerceAtLeast(1)
+            val isTrulyComplete = chEntity.status == "COMPLETED" &&
+                localStorageManager.verifyChapterFilesComplete(expectedPages, validLocalPaths)
+            val effectiveStatus = when {
+                isTrulyComplete -> "COMPLETED"
+                chEntity.status == "COMPLETED" && validLocalPaths.isNotEmpty() -> "INCOMPLETE"
+                chEntity.status == "COMPLETED" -> "FAILED"
+                else -> chEntity.status
+            }
+
             val progress = progressByKey[chEntity.chapterKey]
                 ?: progressList.find { it.chapterNumber == chEntity.chapterNumber }
             val timeText = if (progress != null) {
@@ -346,17 +359,26 @@ class AppRepository(
             } else {
                 ""
             }
+            val dateLabel = when (effectiveStatus) {
+                "COMPLETED" -> "جاهز بدون إنترنت (${validLocalPaths.size} ص)"
+                "INCOMPLETE" -> "غير مكتمل (${validLocalPaths.size}/$expectedPages ص)"
+                "DOWNLOADING", "QUEUED" -> "جارٍ التنزيل (${validLocalPaths.size}/$expectedPages ص)"
+                else -> "فشل التنزيل"
+            }
             MangaChapter(
                 id = chEntity.chapterId,
                 number = chEntity.chapterNumber,
                 title = chEntity.chapterTitle,
-                dateText = if (chEntity.status == "COMPLETED") "محفوظ محلياً" else "غير مكتمل",
+                dateText = dateLabel,
                 chapterUrl = chEntity.chapterUrl,
-                pageCount = chEntity.totalPages.coerceAtLeast(localPaths.size).coerceAtLeast(1),
+                pageCount = expectedPages,
+                downloadedPagesCount = validLocalPaths.size,
                 pageImageUrls = emptyList(),
-                localPagePaths = localPaths,
-                isDownloaded = chEntity.status == "COMPLETED",
-                downloadStatus = chEntity.status,
+                localPagePaths = validLocalPaths,
+                isDownloaded = isTrulyComplete,
+                downloadStatus = effectiveStatus,
+                downloadError = chEntity.errorMessage.orEmpty(),
+                isRead = progress != null && (progress.isCompleted || progress.lastPageIndex >= 0),
                 lastReadPage = progress?.lastPageIndex ?: -1,
                 lastReadTimeText = timeText,
                 chapterKey = chEntity.chapterKey
@@ -369,6 +391,10 @@ class AppRepository(
             .filter { it.isNotEmpty() }
 
         val resolvedCover = entity.remoteCoverUrl.ifBlank { entity.coverUrl }
+        val verifiedLocalCover = entity.localCoverPath.takeIf { localStorageManager.hasValidLocalCover(it) }
+            ?: localStorageManager.getExistingValidCoverFile(entity.sourceId, entity.workId)?.absolutePath.orEmpty()
+        val completedCount = chapters.count { it.isDownloaded }
+        val incompleteCount = chapters.count { !it.isDownloaded }
 
         MangaWork(
             id = entity.workId,
@@ -378,8 +404,8 @@ class AppRepository(
             siteUrl = entity.sourceUrl,
             siteIconKey = entity.siteIconKey,
             mangaUrl = entity.mangaUrl,
-            coverImageUrl = resolvedCover,
-            coverUrl = resolvedCover,
+            coverImageUrl = resolvedCover.ifBlank { null },
+            coverUrl = resolvedCover.ifBlank { null },
             rating = entity.rating,
             status = entity.status,
             type = entity.type,
@@ -388,14 +414,18 @@ class AppRepository(
             artist = entity.author,
             viewsText = "محلي",
             chaptersCount = maxOf(entity.totalChaptersOnSite, chapters.size),
+            savedChaptersCount = completedCount,
+            incompleteChaptersCount = incompleteCount,
             genres = genresList,
             description = entity.synopsis,
             synopsis = entity.synopsis,
             chapters = chapters,
             sourceId = entity.sourceId,
-            localCoverPath = entity.localCoverPath,
+            localCoverPath = verifiedLocalCover,
             isFromLocalStorage = true,
-            storageSizeBytes = entity.totalStorageBytes,
+            storageSizeBytes = entity.totalStorageBytes.coerceAtLeast(
+                localStorageManager.getWorkStorageBytes(entity.sourceId, entity.workId)
+            ),
             isDetailsLoaded = true
         )
     }
@@ -540,6 +570,11 @@ class AppRepository(
     suspend fun retryFailedDownloadTask(task: DownloadTaskEntity) = withContext(Dispatchers.IO) {
         val workId = task.workId.ifBlank { "work_${task.id}" }
         val existingWork = dao.getDownloadedWorkById(workId)
+        val existingCh = if (task.chapterKey.isNotBlank()) {
+            dao.getDownloadedChapterByKey(task.chapterKey)
+        } else {
+            dao.getDownloadedChaptersForWorkOnce(workId).find { it.chapterNumber == task.chapterNumber }
+        }
         val work = if (existingWork != null) {
             buildOfflineMangaWorkFromEntity(existingWork)
         } else {
@@ -553,17 +588,18 @@ class AppRepository(
                 coverUrl = task.coverUrl
             )
         }
-        val chNum = task.chapterNumber.coerceAtLeast(1)
+        val chNum = task.chapterNumber.coerceAtLeast(existingCh?.chapterNumber ?: 1)
         val chapter = MangaChapter(
-            id = task.chapterId.ifBlank { "ch-$chNum" },
+            id = task.chapterId.ifBlank { existingCh?.chapterId ?: "ch-$chNum" },
             number = chNum,
-            title = "الفصل $chNum",
+            title = existingCh?.chapterTitle?.ifBlank { "الفصل $chNum" } ?: "الفصل $chNum",
             dateText = "الآن",
-            chapterUrl = task.url,
-            pageCount = task.totalPages.coerceAtLeast(5)
+            chapterUrl = existingCh?.chapterUrl?.ifBlank { task.url } ?: task.url,
+            pageCount = task.totalPages.coerceAtLeast(existingCh?.pageCount ?: 1),
+            chapterKey = task.chapterKey.ifBlank { existingCh?.chapterKey.orEmpty() }
         )
         dao.deleteDownloadTask(task)
-        mangaDownloadManager.downloadChapterSuspend(work, chapter)
+        mangaDownloadManager.enqueueChaptersDownload(work, listOf(chapter))
     }
 
     suspend fun importFileFromUri(uri: Uri): Result<SavedWorkEntity> = withContext(Dispatchers.IO) {

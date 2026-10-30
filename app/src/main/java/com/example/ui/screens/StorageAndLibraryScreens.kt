@@ -121,6 +121,7 @@ fun StorageLibraryScreen(
     onOpenWork: (SavedWorkEntity) -> Unit,
     onSelectMangaWork: (MangaWork) -> Unit,
     onOpenDownloadedWork: (DownloadedWorkEntity) -> Unit = {},
+    onDeleteDownloadedWork: (String) -> Unit = {},
     onDeleteWork: (SavedWorkEntity) -> Unit,
     onContinueReadingClick: () -> Unit,
     onOpenDownloadsScreen: () -> Unit,
@@ -145,15 +146,18 @@ fun StorageLibraryScreen(
 
     val combinedWorks = remember(downloadedWorks, savedWorks, searchQuery, sortMode) {
         val offlineItems = downloadedWorks.map { entity ->
+            val remoteCover = entity.remoteCoverUrl.ifBlank { entity.coverUrl }
             MangaWork(
                 id = entity.workId,
+                sourceId = entity.sourceId,
                 title = entity.title,
                 subtitle = entity.subtitle,
                 siteName = entity.sourceName.ifBlank { "التخزين" },
                 siteUrl = entity.sourceUrl,
                 siteIconKey = entity.siteIconKey,
                 mangaUrl = entity.mangaUrl,
-                coverUrl = entity.coverUrl,
+                coverImageUrl = remoteCover,
+                coverUrl = remoteCover,
                 rating = entity.rating,
                 status = entity.status,
                 type = entity.type,
@@ -162,7 +166,8 @@ fun StorageLibraryScreen(
                 synopsis = entity.synopsis,
                 localCoverPath = entity.localCoverPath,
                 isFromLocalStorage = true,
-                storageSizeBytes = entity.totalStorageBytes
+                storageSizeBytes = entity.totalStorageBytes,
+                savedChaptersCount = entity.savedChaptersCount
             ) to entity
         }
         val importedItems = savedWorks
@@ -194,7 +199,7 @@ fun StorageLibraryScreen(
         when (sortMode) {
             "الاسم", "أبجدي" -> matching.sortedBy { it.first.title }
             "الحجم" -> matching.sortedByDescending { it.first.storageSizeBytes }
-            else -> matching
+            else -> matching.sortedByDescending { it.second?.updatedAt ?: 0L }
         }
     }
 
@@ -495,32 +500,57 @@ fun StorageLibraryScreen(
                                             overflow = TextOverflow.Ellipsis
                                         )
                                     }
-                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                    val savedChaptersLabel = if (downloadedEntity != null) {
+                                        "${downloadedEntity.savedChaptersCount} فصول محفوظة • ${MainViewModel.formatBytesArabic(mangaWork.storageSizeBytes)}"
+                                    } else {
+                                        MainViewModel.formatBytesArabic(mangaWork.storageSizeBytes)
+                                    }
+                                    Text(
+                                        text = savedChaptersLabel,
+                                        color = Color(0xFF9AC5F4),
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    Spacer(modifier = Modifier.height(6.dp))
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
                                         horizontalArrangement = Arrangement.SpaceBetween,
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Row {
-                                            repeat(5) {
-                                                Icon(
-                                                    imageVector = Icons.Default.Star,
-                                                    contentDescription = null,
-                                                    tint = Color(0xFF60667A),
-                                                    modifier = Modifier.size(15.dp)
-                                                )
-                                            }
-                                        }
-                                        TextButton(
-                                            onClick = {
-                                                if (downloadedEntity != null) {
-                                                    onOpenDownloadedWork(downloadedEntity)
-                                                } else {
-                                                    onSelectMangaWork(mangaWork)
+                                        Text(
+                                            text = "جاهز بدون إنترنت",
+                                            color = Color(0xFF81C784),
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            if (downloadedEntity != null) {
+                                                IconButton(
+                                                    onClick = { onDeleteDownloadedWork(downloadedEntity.workId) },
+                                                    modifier = Modifier
+                                                        .size(34.dp)
+                                                        .testTag("storage_delete_work_${mangaWork.id}")
+                                                ) {
+                                                    Icon(
+                                                        imageVector = Icons.Default.Delete,
+                                                        contentDescription = "حذف التنزيل",
+                                                        tint = Color(0xFFFF8A80),
+                                                        modifier = Modifier.size(18.dp)
+                                                    )
                                                 }
                                             }
-                                        ) {
-                                            Text("إقرأ", color = PeriwinklePrimary, fontWeight = FontWeight.Bold)
+                                            TextButton(
+                                                onClick = {
+                                                    if (downloadedEntity != null) {
+                                                        onOpenDownloadedWork(downloadedEntity)
+                                                    } else {
+                                                        onSelectMangaWork(mangaWork)
+                                                    }
+                                                }
+                                            ) {
+                                                Text("إقرأ", color = PeriwinklePrimary, fontWeight = FontWeight.Bold)
+                                            }
                                         }
                                     }
                                 }
@@ -563,13 +593,32 @@ fun StorageLibraryScreen(
                                 .testTag("storage_manga_card_${mangaWork.id}"),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            MangaCoverArtwork(
-                                work = mangaWork,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .aspectRatio(0.71f),
-                                showArabicTitleBanner = false
-                            )
+                            Box(modifier = Modifier.fillMaxWidth()) {
+                                MangaCoverArtwork(
+                                    work = mangaWork,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .aspectRatio(0.71f),
+                                    showArabicTitleBanner = false
+                                )
+                                if (downloadedEntity != null && downloadedEntity.savedChaptersCount > 0) {
+                                    Surface(
+                                        shape = RoundedCornerShape(6.dp),
+                                        color = Color(0xD9151924),
+                                        modifier = Modifier
+                                            .align(Alignment.TopStart)
+                                            .padding(6.dp)
+                                    ) {
+                                        Text(
+                                            text = "${downloadedEntity.savedChaptersCount} فصول",
+                                            color = PeriwinklePrimary,
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
+                            }
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
                                 text = mangaWork.title,
@@ -583,6 +632,15 @@ fun StorageLibraryScreen(
                                     .fillMaxWidth()
                                     .padding(horizontal = 2.dp)
                             )
+                            if (downloadedEntity != null) {
+                                Text(
+                                    text = "${downloadedEntity.savedChaptersCount} فصول محفوظة",
+                                    color = TextSecondaryGrey,
+                                    fontSize = 10.sp,
+                                    maxLines = 1,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
                         }
                     }
                 }
@@ -860,14 +918,16 @@ private fun DownloadTaskCard(
     onDelete: () -> Unit
 ) {
     val isActive = task.status == "DOWNLOADING" || task.status == "QUEUED" || task.status == "PAUSED"
-    val workForThumb = remember(task.workId, task.title, task.coverUrl) {
+    val workForThumb = remember(task.workId, task.title, task.coverUrl, task.coverPath) {
         MangaWork(
             id = task.workId.ifBlank { "task_${task.id}" },
             title = task.title,
             siteName = task.sourceName,
             siteUrl = "",
             siteIconKey = "globe",
-            coverUrl = task.coverUrl
+            coverImageUrl = task.coverUrl,
+            coverUrl = task.coverUrl,
+            localCoverPath = task.coverPath
         )
     }
 
