@@ -1,3 +1,9 @@
+# لتفعيل البناء التلقائي على GitHub Actions:
+# بعد رفع المشروع إلى GitHub، افتح هذا الملف في موقع GitHub، اضغط على زر التعديل (Edit)،
+# ثم غيّر اسم ومسار الملف في الأعلى إلى:
+# .github/workflows/android-build.yml
+# ثم اضغط Commit changes ليبدأ البناء التلقائي واستخراج ملف APK.
+
 name: Build Android APK
 
 on:
@@ -33,7 +39,10 @@ jobs:
           SDKMANAGER=$(find "$ANDROID_SDK_ROOT" -name sdkmanager -type f | sort -V | tail -n 1)
           if [ -n "$SDKMANAGER" ]; then
             yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
-            "$SDKMANAGER" --install "platform-tools" "build-tools;36.0.0" "platforms;android-36" "platforms;android-36.1" > /dev/null 2>&1 || true
+            "$SDKMANAGER" --install "platform-tools" > /dev/null 2>&1 || true
+            "$SDKMANAGER" --install "build-tools;36.0.0" > /dev/null 2>&1 || true
+            "$SDKMANAGER" --install "platforms;android-36" > /dev/null 2>&1 || true
+            "$SDKMANAGER" --install "platforms;android-36.1" > /dev/null 2>&1 || true
           fi
 
       - name: Prepare .env and debug.keystore
@@ -50,7 +59,11 @@ jobs:
           if [ ! -f "app/.env" ]; then
             cp app/.env.example app/.env || touch app/.env
           fi
-          if [ ! -f "debug.keystore" ]; then
+          if [ ! -f "debug.keystore" ] && [ -f "debug.keystore.base64" ]; then
+            base64 -d debug.keystore.base64 > debug.keystore 2>/dev/null || base64 --decode debug.keystore.base64 > debug.keystore 2>/dev/null || rm -f debug.keystore
+          fi
+          if [ ! -f "debug.keystore" ] || [ ! -s "debug.keystore" ]; then
+            rm -f debug.keystore
             keytool -genkeypair -v \
               -keystore debug.keystore \
               -storepass android \

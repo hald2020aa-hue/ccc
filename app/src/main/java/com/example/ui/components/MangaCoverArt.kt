@@ -63,12 +63,13 @@ import com.example.ui.theme.PeriwinkleOnPrimary
 import com.example.ui.theme.PeriwinklePrimary
 import com.example.ui.theme.TextPrimaryWhite
 import com.example.ui.theme.TextSecondaryGrey
+import java.io.File
 
 @Composable
 fun MangaPlaceholderCoverBox(
     modifier: Modifier = Modifier
 ) {
-    // Neutral dark placeholder card matching 00:11-00:12 while real website covers load
+    // Neutral dark placeholder card matching 00:39-00:40 while real website covers load
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(8.dp))
@@ -91,27 +92,38 @@ fun MangaCoverArtwork(
     showArabicTitleBanner: Boolean = false
 ) {
     val context = LocalContext.current
+    val localCover = work.localCoverPath.trim()
+    val hasLocalFile = remember(localCover) {
+        localCover.isNotBlank() && File(localCover).exists() && File(localCover).length() > 64L
+    }
     val coverUrl = work.coverImageUrl?.trim().orEmpty()
 
-    if (coverUrl.isBlank()) {
+    if (!hasLocalFile && coverUrl.isBlank()) {
         MangaPlaceholderCoverBox(modifier = modifier)
         return
     }
 
-    val imageRequest = remember(coverUrl, work.siteUrl) {
-        val builder = ImageRequest.Builder(context)
-            .data(coverUrl)
-            .crossfade(true)
-            .addHeader("User-Agent", LiveMangaSiteScraper.activeUserAgent)
+    val imageRequest = remember(hasLocalFile, localCover, coverUrl, work.siteUrl) {
+        if (hasLocalFile) {
+            ImageRequest.Builder(context)
+                .data(File(localCover))
+                .crossfade(true)
+                .build()
+        } else {
+            val builder = ImageRequest.Builder(context)
+                .data(coverUrl)
+                .crossfade(true)
+                .addHeader("User-Agent", LiveMangaSiteScraper.activeUserAgent)
 
-        if (work.siteUrl.isNotBlank()) {
-            builder.addHeader("Referer", work.siteUrl)
+            if (work.siteUrl.isNotBlank()) {
+                builder.addHeader("Referer", work.siteUrl)
+            }
+            val cookie = LiveMangaSiteScraper.getCookiesForUrl(coverUrl)
+            if (cookie.isNotBlank()) {
+                builder.addHeader("Cookie", cookie)
+            }
+            builder.build()
         }
-        val cookie = LiveMangaSiteScraper.getCookiesForUrl(coverUrl)
-        if (cookie.isNotBlank()) {
-            builder.addHeader("Cookie", cookie)
-        }
-        builder.build()
     }
 
     SubcomposeAsyncImage(
@@ -135,14 +147,26 @@ fun ChapterPageIllustration(
     pageIndex: Int,
     totalPages: Int,
     pageImageUrl: String? = null,
+    localFilePath: String? = null,
     refererUrl: String? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     var retryNonce by remember { mutableIntStateOf(0) }
+    val cleanLocalPath = remember(localFilePath, pageImageUrl) {
+        when {
+            !localFilePath.isNullOrBlank() -> localFilePath.trim()
+            pageImageUrl?.startsWith("file://") == true -> pageImageUrl.removePrefix("file://").trim()
+            pageImageUrl?.startsWith("/") == true -> pageImageUrl.trim()
+            else -> ""
+        }
+    }
+    val hasValidLocalFile = remember(cleanLocalPath, retryNonce) {
+        cleanLocalPath.isNotBlank() && File(cleanLocalPath).exists() && File(cleanLocalPath).length() >= 64L
+    }
     val cleanUrl = pageImageUrl?.trim().orEmpty()
 
-    if (cleanUrl.isBlank()) {
+    if (!hasValidLocalFile && cleanUrl.isBlank()) {
         Box(
             modifier = modifier
                 .fillMaxWidth()
@@ -158,7 +182,7 @@ fun ChapterPageIllustration(
                 )
                 Spacer(modifier = Modifier.height(10.dp))
                 Text(
-                    text = "جاري جلب الصفحة ${pageIndex + 1} من الموقع...",
+                    text = "جاري جلب الصفحة ${pageIndex + 1}...",
                     color = TextSecondaryGrey,
                     fontSize = 13.sp
                 )
@@ -167,22 +191,31 @@ fun ChapterPageIllustration(
         return
     }
 
-    val imageRequest = remember(cleanUrl, refererUrl, retryNonce) {
-        val builder = ImageRequest.Builder(context)
-            .data(cleanUrl)
-            .crossfade(true)
-            .addHeader("User-Agent", LiveMangaSiteScraper.activeUserAgent)
-            .setParameter("retry_nonce", retryNonce)
+    val imageRequest = remember(hasValidLocalFile, cleanLocalPath, cleanUrl, refererUrl, retryNonce) {
+        if (hasValidLocalFile) {
+            // Read directly from local disk without any network request (100% offline capable)
+            ImageRequest.Builder(context)
+                .data(File(cleanLocalPath))
+                .crossfade(false)
+                .setParameter("retry_nonce", retryNonce)
+                .build()
+        } else {
+            val builder = ImageRequest.Builder(context)
+                .data(cleanUrl)
+                .crossfade(true)
+                .addHeader("User-Agent", LiveMangaSiteScraper.activeUserAgent)
+                .setParameter("retry_nonce", retryNonce)
 
-        val effectiveReferer = refererUrl?.ifBlank { work.mangaUrl.ifBlank { work.siteUrl } } ?: work.siteUrl
-        if (effectiveReferer.isNotBlank()) {
-            builder.addHeader("Referer", effectiveReferer)
+            val effectiveReferer = refererUrl?.ifBlank { work.mangaUrl.ifBlank { work.siteUrl } } ?: work.siteUrl
+            if (effectiveReferer.isNotBlank()) {
+                builder.addHeader("Referer", effectiveReferer)
+            }
+            val cookie = LiveMangaSiteScraper.getCookiesForUrl(cleanUrl)
+            if (cookie.isNotBlank()) {
+                builder.addHeader("Cookie", cookie)
+            }
+            builder.build()
         }
-        val cookie = LiveMangaSiteScraper.getCookiesForUrl(cleanUrl)
-        if (cookie.isNotBlank()) {
-            builder.addHeader("Cookie", cookie)
-        }
-        builder.build()
     }
 
     SubcomposeAsyncImage(
@@ -293,6 +326,8 @@ fun HiddenSiteWebViewBridge(
 
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
+                    settings.allowFileAccess = false
+                    settings.allowContentAccess = false
                     settings.loadsImagesAutomatically = false
                     settings.blockNetworkImage = true
                     LiveMangaSiteScraper.activeUserAgent = settings.userAgentString ?: LiveMangaSiteScraper.DEFAULT_USER_AGENT
@@ -413,6 +448,8 @@ fun CloudflareProtectionDialog(
 
                                 settings.javaScriptEnabled = true
                                 settings.domStorageEnabled = true
+                                settings.allowFileAccess = false
+                                settings.allowContentAccess = false
                                 settings.useWideViewPort = true
                                 settings.loadWithOverviewMode = true
                                 LiveMangaSiteScraper.activeUserAgent =

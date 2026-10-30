@@ -45,6 +45,7 @@ import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -123,12 +124,24 @@ fun MangaChapterReaderScreen(
 ) {
     val scope = rememberCoroutineScope()
 
-    var livePageUrls by remember(chapter.id, chapter.chapterUrl) {
+    val isOfflineComplete = remember(chapter.id, chapter.localPagePaths, chapter.downloadStatus) {
+        chapter.localPagePaths.isNotEmpty() && chapter.downloadStatus == "COMPLETED"
+    }
+    val isOfflineIncomplete = remember(chapter.id, chapter.downloadStatus) {
+        chapter.downloadStatus == "INCOMPLETE"
+    }
+
+    var localPagePaths by remember(chapter.id, chapter.localPagePaths) {
+        mutableStateOf(chapter.localPagePaths)
+    }
+    var livePageUrls by remember(chapter.id, chapter.chapterUrl, chapter.pageImageUrls) {
         mutableStateOf(chapter.pageImageUrls)
     }
-    var loadingProgress by remember(chapter.id, chapter.chapterUrl) { mutableIntStateOf(3) }
-    var isChapterLoaded by remember(chapter.id, chapter.chapterUrl) {
-        mutableStateOf(chapter.pageImageUrls.isNotEmpty())
+    var loadingProgress by remember(chapter.id, isOfflineComplete) {
+        mutableIntStateOf(if (isOfflineComplete || chapter.pageImageUrls.isNotEmpty()) 100 else 3)
+    }
+    var isChapterLoaded by remember(chapter.id, isOfflineComplete) {
+        mutableStateOf(isOfflineComplete || chapter.pageImageUrls.isNotEmpty())
     }
     var requiresCloudflare by remember(chapter.id, chapter.chapterUrl) { mutableStateOf(false) }
     var showProtectionModal by remember { mutableStateOf(false) }
@@ -140,9 +153,14 @@ fun MangaChapterReaderScreen(
         }
     }
 
-    // Fetch live chapter page image URLs directly from the website while animating progress (00:39 - 00:47)
-    LaunchedEffect(chapter.id, targetChapterUrl, refreshTrigger) {
-        if (livePageUrls.isEmpty() || refreshTrigger > 0) {
+    // Only fetch from network if NOT reading a completed local chapter (100% offline support!)
+    LaunchedEffect(chapter.id, targetChapterUrl, isOfflineComplete, refreshTrigger) {
+        if (isOfflineComplete && refreshTrigger == 0) {
+            loadingProgress = 100
+            isChapterLoaded = true
+            return@LaunchedEffect
+        }
+        if ((livePageUrls.isEmpty() && localPagePaths.isEmpty()) || refreshTrigger > 0) {
             isChapterLoaded = false
             loadingProgress = 3
             delay(90)
@@ -164,33 +182,39 @@ fun MangaChapterReaderScreen(
                 isChapterLoaded = true
             } else {
                 loadingProgress = 97
-                // Give HiddenSiteWebViewBridge a moment to extract lazy-loaded DOM images
                 delay(1200)
                 isChapterLoaded = true
             }
         }
     }
 
-    // Hidden WebView DOM Bridge to extract chapter images rendered by JS (e.g. ts_reader / Madara lazy images)
-    HiddenSiteWebViewBridge(
-        targetUrl = targetChapterUrl,
-        jsExtractorScript = LiveMangaSiteScraper.JS_EXTRACT_CHAPTER_PAGES,
-        reloadTrigger = refreshTrigger,
-        onResultJson = { rawJson ->
-            val domRes = LiveMangaSiteScraper.parseChapterPagesFromDomJson(rawJson, targetChapterUrl)
-            if (domRes.pageUrls.isNotEmpty()) {
-                livePageUrls = domRes.pageUrls
-                requiresCloudflare = false
-                loadingProgress = 100
-                isChapterLoaded = true
-            } else if (domRes.requiresCloudflare && livePageUrls.isEmpty()) {
-                requiresCloudflare = true
-                isChapterLoaded = true
+    // Hidden WebView DOM Bridge only when online and not reading from local disk
+    if (!isOfflineComplete || refreshTrigger > 0) {
+        HiddenSiteWebViewBridge(
+            targetUrl = targetChapterUrl,
+            jsExtractorScript = LiveMangaSiteScraper.JS_EXTRACT_CHAPTER_PAGES,
+            reloadTrigger = refreshTrigger,
+            onResultJson = { rawJson ->
+                val domRes = LiveMangaSiteScraper.parseChapterPagesFromDomJson(rawJson, targetChapterUrl)
+                if (domRes.pageUrls.isNotEmpty()) {
+                    livePageUrls = domRes.pageUrls
+                    requiresCloudflare = false
+                    loadingProgress = 100
+                    isChapterLoaded = true
+                } else if (domRes.requiresCloudflare && livePageUrls.isEmpty() && localPagePaths.isEmpty()) {
+                    requiresCloudflare = true
+                    isChapterLoaded = true
+                }
             }
-        }
-    )
+        )
+    }
 
-    val totalPages = livePageUrls.size.coerceAtLeast(1)
+    val effectivePageCount = when {
+        localPagePaths.isNotEmpty() -> localPagePaths.size
+        livePageUrls.isNotEmpty() -> livePageUrls.size
+        else -> 0
+    }
+    val totalPages = effectivePageCount.coerceAtLeast(1)
 
     var showReaderHud by remember { mutableStateOf(true) }
     var showQuickTunePopup by remember { mutableStateOf(false) }
@@ -224,7 +248,7 @@ fun MangaChapterReaderScreen(
 
     // Auto-scroll support if enabled in settings
     LaunchedEffect(settings.autoScroll, isChapterLoaded, isWebtoonMode, totalPages) {
-        if (settings.autoScroll && isChapterLoaded && isWebtoonMode && livePageUrls.isNotEmpty()) {
+        if (settings.autoScroll && isChapterLoaded && isWebtoonMode && effectivePageCount > 0) {
             while (true) {
                 delay(1800)
                 val next = (webtoonListState.firstVisibleItemIndex + 1).coerceAtMost(totalPages - 1)
@@ -280,7 +304,7 @@ fun MangaChapterReaderScreen(
             }
             .testTag("manga_chapter_reader_screen")
     ) {
-        // ==================== MAIN READER AREA (LOADING OR LIVE CHAPTER PAGES) ====================
+        // ==================== MAIN READER AREA (OFFLINE LOCAL FILES OR LIVE CHAPTER PAGES) ====================
         if (!isChapterLoaded) {
             // Exact Loading Screen from 00:39 - 00:47:
             // "التحميل: ٢٧٪" + Horizontal LinearProgressIndicator
@@ -316,7 +340,7 @@ fun MangaChapterReaderScreen(
                     }
                 }
             }
-        } else if (livePageUrls.isEmpty()) {
+        } else if (effectivePageCount == 0) {
             // Prompt to verify Cloudflare or reload chapter images from website
             Box(
                 modifier = Modifier
@@ -367,7 +391,7 @@ fun MangaChapterReaderScreen(
             }
         } else {
             if (isWebtoonMode) {
-                // Continuous Vertical Webtoon Strip displaying real website page images (00:48 - 00:52)
+                // Continuous Vertical Webtoon Strip displaying local files or live website images
                 LazyColumn(
                     state = webtoonListState,
                     modifier = Modifier
@@ -379,13 +403,50 @@ fun MangaChapterReaderScreen(
                         .testTag("reader_webtoon_list"),
                     contentPadding = PaddingValues(bottom = 32.dp)
                 ) {
-                    items(livePageUrls.size, key = { "page_$it" }) { pageIdx ->
+                    if (isOfflineIncomplete) {
+                        item(key = "incomplete_warning") {
+                            Surface(
+                                color = Color(0xFF3E2723),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .testTag("reader_incomplete_warning_banner")
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Icon(Icons.Default.Warning, null, tint = Color(0xFFFF8A80))
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = "هذا الفصل غير مكتمل (${localPagePaths.size}/${chapter.pageCount} صور)",
+                                            color = TextPrimaryWhite,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                    TextButton(onClick = { onDownloadChapter(work, chapter) }) {
+                                        Text("إعادة التنزيل", color = PeriwinklePrimary, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    items(effectivePageCount, key = { "page_$it" }) { pageIdx ->
                         ChapterPageIllustration(
                             work = work,
                             chapterNumber = chapter.number,
                             pageIndex = pageIdx,
-                            totalPages = livePageUrls.size,
-                            pageImageUrl = livePageUrls[pageIdx],
+                            totalPages = effectivePageCount,
+                            pageImageUrl = livePageUrls.getOrNull(pageIdx),
+                            localFilePath = localPagePaths.getOrNull(pageIdx),
                             refererUrl = targetChapterUrl
                         )
                     }
@@ -455,8 +516,9 @@ fun MangaChapterReaderScreen(
                                 work = work,
                                 chapterNumber = chapter.number,
                                 pageIndex = pageIdx,
-                                totalPages = livePageUrls.size,
+                                totalPages = effectivePageCount,
                                 pageImageUrl = livePageUrls.getOrNull(pageIdx),
+                                localFilePath = localPagePaths.getOrNull(pageIdx),
                                 refererUrl = targetChapterUrl
                             )
                         }
@@ -519,8 +581,8 @@ fun MangaChapterReaderScreen(
                             overflow = TextOverflow.Ellipsis
                         )
                         Text(
-                            text = chapter.title,
-                            color = TextSecondaryGrey,
+                            text = if (isOfflineComplete) "${chapter.title} • بدون إنترنت" else chapter.title,
+                            color = if (isOfflineComplete) Color(0xFF81C784) else TextSecondaryGrey,
                             fontSize = 11.sp,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
@@ -572,7 +634,7 @@ fun MangaChapterReaderScreen(
             enter = fadeIn(),
             exit = fadeOut(),
             modifier = Modifier
-                .align(Alignment.BottomStart) // In RTL, BottomStart is Bottom-Right!
+                .align(Alignment.BottomStart)
                 .padding(start = 16.dp, bottom = 132.dp)
         ) {
             Surface(
@@ -662,7 +724,7 @@ fun MangaChapterReaderScreen(
                             .fillMaxWidth()
                             .padding(top = 10.dp, bottom = 4.dp)
                     ) {
-                        // Row 1: Next/Prev Chapter Circular Buttons + Dotted Page Slider (00:41 - 00:52)
+                        // Row 1: Next/Prev Chapter Circular Buttons + Dotted Page Slider
                         CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
                             Row(
                                 modifier = Modifier
@@ -671,7 +733,6 @@ fun MangaChapterReaderScreen(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
-                                // Left circular button: Previous Chapter
                                 Surface(
                                     shape = CircleShape,
                                     color = if (prevChapter != null) Color(0xFF232734) else Color(0xFF191C24),
@@ -696,7 +757,6 @@ fun MangaChapterReaderScreen(
                                     }
                                 }
 
-                                // Middle Pill Slider with Dots (00:41 - 00:52)
                                 Box(
                                     modifier = Modifier
                                         .weight(1f)
@@ -706,7 +766,6 @@ fun MangaChapterReaderScreen(
                                         .padding(horizontal = 14.dp),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    // Subtle page dots along the track
                                     Canvas(modifier = Modifier.fillMaxWidth().height(8.dp)) {
                                         val count = totalPages.coerceIn(2, 24)
                                         val step = size.width / (count - 1)
@@ -732,7 +791,6 @@ fun MangaChapterReaderScreen(
                                     )
                                 }
 
-                                // Right circular button: Next Chapter
                                 Surface(
                                     shape = CircleShape,
                                     color = if (nextChapter != null) Color(0xFF232734) else Color(0xFF191C24),
@@ -761,7 +819,7 @@ fun MangaChapterReaderScreen(
 
                         Spacer(modifier = Modifier.height(4.dp))
 
-                        // Row 2: 5 Action Icons from Left to Right (♡, 💾, 🔖, 🔄, 🎛) matching 00:41 - 00:52
+                        // Row 2: 5 Action Icons from Left to Right (♡, 💾, 🔖, 🔄, 🎛)
                         CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
                             Row(
                                 modifier = Modifier
@@ -789,7 +847,7 @@ fun MangaChapterReaderScreen(
                                             work,
                                             chapter.copy(
                                                 pageImageUrls = livePageUrls,
-                                                pageCount = livePageUrls.size
+                                                pageCount = effectivePageCount.coerceAtLeast(chapter.pageCount)
                                             )
                                         )
                                     },
@@ -798,7 +856,7 @@ fun MangaChapterReaderScreen(
                                     Icon(
                                         imageVector = Icons.Default.Save,
                                         contentDescription = "حفظ الفصل",
-                                        tint = TextPrimaryWhite,
+                                        tint = if (isOfflineComplete) Color(0xFF81C784) else TextPrimaryWhite,
                                         modifier = Modifier.size(22.dp)
                                     )
                                 }
@@ -853,7 +911,7 @@ fun MangaChapterReaderScreen(
                 }
             }
 
-            // Bottom Mini Status Strip (00:40 - 00:52): Time on Right, Page "١/١٢" in Center, Battery "68%" on Left
+            // Bottom Mini Status Strip: Time on Right, Page "١/١٢" in Center, Battery "68%" on Left
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
                 Row(
                     modifier = Modifier
@@ -876,7 +934,8 @@ fun MangaChapterReaderScreen(
                             text = "$curAr/$totAr",
                             color = TextPrimaryWhite,
                             fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.testTag("reader_page_indicator_text")
                         )
                     } else {
                         Spacer(modifier = Modifier.width(1.dp))

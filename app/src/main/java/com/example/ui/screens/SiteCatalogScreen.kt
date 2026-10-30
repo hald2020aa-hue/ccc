@@ -1,8 +1,10 @@
 package com.example.ui.screens
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,6 +22,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -28,18 +31,27 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Book
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FilterList
+import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.OpenInBrowser
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedButton
@@ -72,12 +84,15 @@ import com.example.data.local.SiteEntity
 import com.example.ui.components.CloudflareProtectionDialog
 import com.example.ui.components.HiddenSiteWebViewBridge
 import com.example.ui.components.MangaCoverArtwork
+import com.example.ui.theme.AppCardSurface
 import com.example.ui.theme.AppDialogSurface
+import com.example.ui.theme.AppDividerColor
 import com.example.ui.theme.PeriwinkleOnPrimary
 import com.example.ui.theme.PeriwinklePrimary
 import com.example.ui.theme.TextPrimaryWhite
 import com.example.ui.theme.TextSecondaryGrey
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun SiteCatalogScreen(
     site: SiteEntity,
@@ -87,16 +102,31 @@ fun SiteCatalogScreen(
     onSelectWork: (MangaWork) -> Unit,
     onContinueReadingClick: () -> Unit,
     onOpenSiteInWebView: (SiteEntity) -> Unit,
-    onShowToast: (String) -> Unit
+    onShowToast: (String) -> Unit,
+    onSaveWholeMangaToStorage: (MangaWork) -> Unit = {},
+    onOpenDownloadsScreen: () -> Unit = {},
+    onOpenSettingsScreen: () -> Unit = {}
 ) {
     var searchQuery by remember { mutableStateOf("") }
     var submittedSearchQuery by remember { mutableStateOf("") }
     var showSearchBar by remember { mutableStateOf(false) }
     var selectedGenre by remember { mutableStateOf<String?>(null) }
-    var sortMode by remember { mutableStateOf("آخر التحديثات") }
+    var selectedStatusFilter by remember { mutableStateOf<String?>(null) }
+    var sortMode by remember { mutableStateOf("آخر الاضافات") }
     var showSortMenu by remember { mutableStateOf(false) }
-    var showCategoriesDialog by remember { mutableStateOf(false) }
+    var showFilterSheetDialog by remember { mutableStateOf(false) }
     var showProtectionDialog by remember { mutableStateOf(false) }
+
+    // Overflow ⋮ Menu states (00:42-00:48, 01:46-01:52, 04:18)
+    var showOverflowMenu by remember { mutableStateOf(false) }
+    var showViewModeSubMenu by remember { mutableStateOf(false) }
+    var viewMode by remember { mutableStateOf("متوسط") } // القائمة | صغير | متوسط | كبير
+    var showBookmarksDialog by remember { mutableStateOf(false) }
+    var showJumpToPageDialog by remember { mutableStateOf(false) }
+    var currentPageNumber by remember { mutableIntStateOf(1) }
+
+    // Long-press save manga dialog (02:21 - 02:34)
+    var pendingSaveWork by remember { mutableStateOf<MangaWork?>(null) }
 
     var liveWorks by remember(site.id, site.url) { mutableStateOf(works) }
     var isLoadingCatalog by remember(site.id, site.url) { mutableStateOf(true) }
@@ -104,16 +134,21 @@ fun SiteCatalogScreen(
     var errorMessage by remember(site.id, site.url) { mutableStateOf<String?>(null) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
 
-    val targetCatalogUrl = remember(site.url, submittedSearchQuery, selectedGenre) {
-        LiveMangaSiteScraper.buildCatalogTargetUrl(
+    val targetCatalogUrl = remember(site.url, submittedSearchQuery, selectedGenre, currentPageNumber) {
+        val base = LiveMangaSiteScraper.buildCatalogTargetUrl(
             site = site,
             searchQuery = submittedSearchQuery,
             selectedGenre = selectedGenre
         )
+        if (currentPageNumber > 1 && !base.contains("page=")) {
+            if (base.contains("?")) "$base&page=$currentPageNumber" else "${base.trimEnd('/')}/page/$currentPageNumber/"
+        } else {
+            base
+        }
     }
 
     // Fetch live manga list directly from the added website
-    LaunchedEffect(site.id, site.url, submittedSearchQuery, selectedGenre, refreshTrigger) {
+    LaunchedEffect(site.id, site.url, submittedSearchQuery, selectedGenre, currentPageNumber, refreshTrigger) {
         isLoadingCatalog = true
         errorMessage = null
         val result = LiveMangaSiteScraper.fetchSiteCatalog(
@@ -131,7 +166,6 @@ fun SiteCatalogScreen(
             isLoadingCatalog = false
         } else {
             errorMessage = result.errorMessage
-            // Keep loading briefly while HiddenSiteWebViewBridge extracts DOM via JS
             kotlinx.coroutines.delay(1400)
             isLoadingCatalog = false
         }
@@ -156,7 +190,7 @@ fun SiteCatalogScreen(
         }
     )
 
-    val displayedWorks = remember(liveWorks, searchQuery, sortMode) {
+    val displayedWorks = remember(liveWorks, searchQuery, sortMode, selectedStatusFilter) {
         val byLocalSearch = if (searchQuery.isBlank()) {
             liveWorks
         } else {
@@ -164,10 +198,15 @@ fun SiteCatalogScreen(
                 it.title.contains(searchQuery, ignoreCase = true)
             }
         }
+        val byStatus = if (selectedStatusFilter == null) {
+            byLocalSearch
+        } else {
+            byLocalSearch.filter { it.status.contains(selectedStatusFilter!!, ignoreCase = true) }
+        }
         when (sortMode) {
-            "الأبجدية" -> byLocalSearch.sortedBy { it.title }
-            "الأكثر شعبية" -> byLocalSearch.reversed()
-            else -> byLocalSearch
+            "أبجدي", "الأبجدية" -> byStatus.sortedBy { it.title }
+            "الاكثر مشاهدة", "الأكثر شعبية", "الشائع" -> byStatus.reversed()
+            else -> byStatus
         }
     }
 
@@ -179,7 +218,7 @@ fun SiteCatalogScreen(
             .testTag("site_catalog_screen")
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
-            // Top Bar (00:07 - 00:15): Menu ☰ on Right, Search 🔍 + Protection 🛡️ + Filter on Left
+            // Top Bar (00:07 - 00:48): Menu ☰ on Right, Search 🔍 + Protection 🛡️ + More ⋮ on Left
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -253,21 +292,90 @@ fun SiteCatalogScreen(
                                 tint = if (requiresCloudflare) Color(0xFFFFB74D) else PeriwinklePrimary
                             )
                         }
-                        IconButton(
-                            onClick = { showCategoriesDialog = true },
-                            modifier = Modifier.testTag("site_filter_icon_button")
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.FilterList,
-                                contentDescription = "تصفية",
-                                tint = TextPrimaryWhite
-                            )
+                        Box {
+                            IconButton(
+                                onClick = {
+                                    showViewModeSubMenu = false
+                                    showOverflowMenu = true
+                                },
+                                modifier = Modifier.testTag("site_more_menu_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.MoreVert,
+                                    contentDescription = "خيارات العرض والموقع",
+                                    tint = TextPrimaryWhite
+                                )
+                            }
+                            // Exact 5-item menu from 00:42-00:48 & 01:46-01:52:
+                            // نمط العرض (القائمة، صغير، متوسط، كبير)، المراجع، توجه الى، التنزيلات، الاعدادات
+                            DropdownMenu(
+                                expanded = showOverflowMenu,
+                                onDismissRequest = { showOverflowMenu = false },
+                                containerColor = AppDialogSurface
+                            ) {
+                                if (!showViewModeSubMenu) {
+                                    DropdownMenuItem(
+                                        text = { Text("نمط العرض", color = TextPrimaryWhite) },
+                                        leadingIcon = { Icon(Icons.Default.GridView, null, tint = PeriwinklePrimary) },
+                                        onClick = { showViewModeSubMenu = true }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("المراجع", color = TextPrimaryWhite) },
+                                        leadingIcon = { Icon(Icons.Default.Book, null, tint = PeriwinklePrimary) },
+                                        onClick = {
+                                            showOverflowMenu = false
+                                            showBookmarksDialog = true
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("توجه الى", color = TextPrimaryWhite) },
+                                        leadingIcon = { Icon(Icons.Default.Apps, null, tint = PeriwinklePrimary) },
+                                        onClick = {
+                                            showOverflowMenu = false
+                                            showJumpToPageDialog = true
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("التنزيلات", color = TextPrimaryWhite) },
+                                        leadingIcon = { Icon(Icons.Default.Download, null, tint = PeriwinklePrimary) },
+                                        onClick = {
+                                            showOverflowMenu = false
+                                            onOpenDownloadsScreen()
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("الاعدادات", color = TextPrimaryWhite) },
+                                        leadingIcon = { Icon(Icons.Default.Settings, null, tint = PeriwinklePrimary) },
+                                        onClick = {
+                                            showOverflowMenu = false
+                                            onOpenSettingsScreen()
+                                        }
+                                    )
+                                } else {
+                                    listOf("القائمة", "صغير", "متوسط", "كبير").forEach { mode ->
+                                        DropdownMenuItem(
+                                            text = {
+                                                Text(
+                                                    text = if (viewMode == mode) "✓ $mode" else mode,
+                                                    color = if (viewMode == mode) PeriwinklePrimary else TextPrimaryWhite,
+                                                    fontWeight = if (viewMode == mode) FontWeight.Bold else FontWeight.Normal
+                                                )
+                                            },
+                                            onClick = {
+                                                viewMode = mode
+                                                showViewModeSubMenu = false
+                                                showOverflowMenu = false
+                                            }
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            // Site Title + "آخر التحديثات" Sort Row (00:07 - 00:15)
+            // Site Title + "آخر الاضافات" Sort/Filter Row (00:07 - 00:15, 01:38)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -284,45 +392,27 @@ fun SiteCatalogScreen(
                     overflow = TextOverflow.Ellipsis
                 )
 
-                Box {
-                    Row(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(10.dp))
-                            .clickable { showSortMenu = true }
-                            .padding(horizontal = 8.dp, vertical = 6.dp)
-                            .testTag("site_sort_button"),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.FilterList,
-                            contentDescription = "ترتيب",
-                            tint = Color(0xFFD5DAE6),
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = sortMode,
-                            color = Color(0xFFD5DAE6),
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
-
-                    DropdownMenu(
-                        expanded = showSortMenu,
-                        onDismissRequest = { showSortMenu = false },
-                        containerColor = AppDialogSurface
-                    ) {
-                        listOf("آخر التحديثات", "الأكثر شعبية", "الأبجدية").forEach { mode ->
-                            DropdownMenuItem(
-                                text = { Text(mode, color = TextPrimaryWhite) },
-                                onClick = {
-                                    sortMode = mode
-                                    showSortMenu = false
-                                }
-                            )
-                        }
-                    }
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable { showFilterSheetDialog = true }
+                        .padding(horizontal = 8.dp, vertical = 6.dp)
+                        .testTag("site_sort_button"),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.FilterList,
+                        contentDescription = "الفلتر",
+                        tint = Color(0xFFD5DAE6),
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = sortMode,
+                        color = Color(0xFFD5DAE6),
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
                 }
             }
 
@@ -350,7 +440,7 @@ fun SiteCatalogScreen(
                         modifier = Modifier
                             .clickable {
                                 if (isCategoriesButton) {
-                                    showCategoriesDialog = true
+                                    showFilterSheetDialog = true
                                 } else {
                                     selectedGenre = if (selectedGenre == chip) null else chip
                                 }
@@ -381,10 +471,7 @@ fun SiteCatalogScreen(
                 }
             }
 
-            // Content Area:
-            // 1. Loading Spinner (00:07-00:10)
-            // 2. Cloudflare / Empty / Retry State if blocked or offline
-            // 3. Live Works Grid with Real Website Covers (00:11-00:15)
+            // Content Area
             if (isLoadingCatalog && displayedWorks.isEmpty()) {
                 Box(
                     modifier = Modifier.fillMaxSize(),
@@ -453,9 +540,108 @@ fun SiteCatalogScreen(
                         }
                     }
                 }
+            } else if (viewMode == "القائمة") {
+                // Exact List View from 00:38 - 00:41:
+                // Cover on Right, Title & Genres on Left, 5 stars ★★★★★, and "إقرأ" button
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .testTag("site_works_list"),
+                    contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 8.dp, bottom = 90.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    items(displayedWorks.size, key = { idx -> "${displayedWorks[idx].id}_$idx" }) { index ->
+                        val work = displayedWorks[index]
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = AppCardSurface),
+                            shape = RoundedCornerShape(14.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .combinedClickable(
+                                    onClick = { onSelectWork(work) },
+                                    onLongClick = { pendingSaveWork = work }
+                                )
+                                .testTag("manga_card_${work.id}")
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                MangaCoverArtwork(
+                                    work = work,
+                                    modifier = Modifier
+                                        .width(86.dp)
+                                        .height(120.dp)
+                                )
+                                Spacer(modifier = Modifier.width(14.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = work.title,
+                                        color = TextPrimaryWhite,
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = if (work.genres.isNotEmpty()) work.genres.joinToString(" ، ") else site.name,
+                                        color = TextSecondaryGrey,
+                                        fontSize = 12.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Spacer(modifier = Modifier.height(10.dp))
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Row {
+                                            repeat(5) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Star,
+                                                    contentDescription = null,
+                                                    tint = Color(0xFF5A6075),
+                                                    modifier = Modifier.size(15.dp)
+                                                )
+                                            }
+                                        }
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            IconButton(
+                                                onClick = { pendingSaveWork = work },
+                                                modifier = Modifier
+                                                    .size(32.dp)
+                                                    .testTag("save_work_btn_${work.id}")
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Download,
+                                                    contentDescription = "حفظ المانجا",
+                                                    tint = PeriwinklePrimary,
+                                                    modifier = Modifier.size(18.dp)
+                                                )
+                                            }
+                                            TextButton(onClick = { onSelectWork(work) }) {
+                                                Text("إقرأ", color = PeriwinklePrimary, fontWeight = FontWeight.Bold)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             } else {
+                // Grid Modes from 00:42-00:48: صغير (5 cols), متوسط (3 cols), كبير (2 cols)
+                val minColSize = when (viewMode) {
+                    "صغير" -> 64.dp
+                    "كبير" -> 150.dp
+                    else -> 106.dp
+                }
                 LazyVerticalGrid(
-                    columns = GridCells.Adaptive(minSize = 106.dp),
+                    columns = GridCells.Adaptive(minSize = minColSize),
                     modifier = Modifier
                         .fillMaxSize()
                         .testTag("site_works_grid"),
@@ -468,7 +654,10 @@ fun SiteCatalogScreen(
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable { onSelectWork(work) }
+                                .combinedClickable(
+                                    onClick = { onSelectWork(work) },
+                                    onLongClick = { pendingSaveWork = work }
+                                )
                                 .testTag("manga_card_${work.id}")
                         ) {
                             MangaCoverArtwork(
@@ -481,7 +670,7 @@ fun SiteCatalogScreen(
                             Text(
                                 text = work.title,
                                 color = TextPrimaryWhite,
-                                fontSize = 12.sp,
+                                fontSize = if (viewMode == "صغير") 10.sp else 12.sp,
                                 fontWeight = FontWeight.SemiBold,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
@@ -492,7 +681,7 @@ fun SiteCatalogScreen(
             }
         }
 
-        // Bottom-Left Floating "متابعة" Button (00:07 - 00:15)
+        // Bottom-Left Floating "متابعة" Button
         if (showContinueReadingButton) {
             Surface(
                 shape = RoundedCornerShape(16.dp),
@@ -534,41 +723,148 @@ fun SiteCatalogScreen(
         }
     }
 
-    // Categories Dialog when clicking "⊞ التصنيفات"
-    if (showCategoriesDialog) {
+    // Long-press Save Whole Manga Dialog matching 02:23 - 02:34:
+    // "سيتم حفظ المانجا (جميع X الفصول)." -> حسنا / إلغاء
+    pendingSaveWork?.let { workToSave ->
+        val chapterCount = workToSave.chapters.size.coerceAtLeast(1)
         AlertDialog(
-            onDismissRequest = { showCategoriesDialog = false },
+            onDismissRequest = { pendingSaveWork = null },
+            containerColor = AppDialogSurface,
+            text = {
+                Text(
+                    text = "سيتم حفظ المانجا (جميع $chapterCount الفصول).",
+                    color = TextPrimaryWhite,
+                    fontSize = 15.sp
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingSaveWork = null
+                        onSaveWholeMangaToStorage(workToSave)
+                    },
+                    modifier = Modifier.testTag("confirm_save_whole_manga_btn")
+                ) {
+                    Text("حسنا", color = PeriwinklePrimary, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingSaveWork = null }) {
+                    Text("إلغاء", color = PeriwinklePrimary)
+                }
+            }
+        )
+    }
+
+    // Exact Filter Sheet Dialog from 01:38-01:43 & 05:56-06:00:
+    // الفلتر + مسح التحديد + تصفح حسب + الحالة + التصنيفات
+    if (showFilterSheetDialog) {
+        val sortOptions = listOf("آخر الاضافات", "الاكثر مشاهدة", "جديد", "أبجدي", "التقييم", "الشائع")
+        val statusOptions = listOf("مكتمل", "مستمر", "ملغى", "متوقف")
+        AlertDialog(
+            onDismissRequest = { showFilterSheetDialog = false },
             containerColor = AppDialogSurface,
             title = {
-                Text("تصنيفات ${site.name}", color = TextPrimaryWhite, fontWeight = FontWeight.Bold)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("الفلتر", color = TextPrimaryWhite, fontWeight = FontWeight.Bold, fontSize = 19.sp)
+                    TextButton(
+                        onClick = {
+                            selectedGenre = null
+                            selectedStatusFilter = null
+                            sortMode = "آخر الاضافات"
+                        }
+                    ) {
+                        Text("مسح التحديد", color = TextSecondaryGrey, fontSize = 13.sp)
+                    }
+                }
             },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        text = "اختر التصنيف لجلب الأعمال المطابقة مباشرة من الموقع:",
-                        color = TextSecondaryGrey,
-                        fontSize = 13.sp
-                    )
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("تصفح حسب", color = TextSecondaryGrey, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                    sortOptions.chunked(3).forEach { rowItems ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            rowItems.forEach { option ->
+                                val active = sortMode == option
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (active) Color(0xFF2D3652) else Color.Transparent,
+                                    border = BorderStroke(1.dp, if (active) PeriwinklePrimary else Color(0xFF454A59)),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clickable { sortMode = option }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 7.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.Center
+                                    ) {
+                                        if (active) {
+                                            Icon(Icons.Default.Check, null, tint = PeriwinklePrimary, modifier = Modifier.size(14.dp))
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                        }
+                                        Text(option, color = TextPrimaryWhite, fontSize = 11.sp, maxLines = 1)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalDivider(color = AppDividerColor)
+                    Text("الحالة", color = TextSecondaryGrey, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        statusOptions.forEach { st ->
+                            val active = selectedStatusFilter == st
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (active) Color(0xFF2D3652) else Color.Transparent,
+                                border = BorderStroke(1.dp, if (active) PeriwinklePrimary else Color(0xFF454A59)),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable {
+                                        selectedStatusFilter = if (active) null else st
+                                    }
+                            ) {
+                                Box(
+                                    modifier = Modifier.padding(vertical = 7.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(st, color = TextPrimaryWhite, fontSize = 11.sp)
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalDivider(color = AppDividerColor)
+                    Text("التصنيفات", color = TextSecondaryGrey, fontSize = 13.sp, fontWeight = FontWeight.Bold)
                     MangaCatalogData.siteCategoryChips.drop(1).chunked(3).forEach { rowChips ->
                         Row(
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             rowChips.forEach { genre ->
                                 val active = selectedGenre == genre
                                 OutlinedButton(
                                     onClick = {
                                         selectedGenre = if (active) null else genre
-                                        showCategoriesDialog = false
                                     },
                                     colors = ButtonDefaults.outlinedButtonColors(
                                         containerColor = if (active) PeriwinklePrimary else Color.Transparent,
                                         contentColor = if (active) PeriwinkleOnPrimary else TextPrimaryWhite
                                     ),
-                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp),
                                     modifier = Modifier.weight(1f)
                                 ) {
-                                    Text(genre, fontSize = 12.sp, maxLines = 1)
+                                    Text(genre, fontSize = 11.sp, maxLines = 1)
                                 }
                             }
                         }
@@ -576,18 +872,75 @@ fun SiteCatalogScreen(
                 }
             },
             confirmButton = {
-                TextButton(
-                    onClick = {
-                        selectedGenre = null
-                        showCategoriesDialog = false
-                    }
+                TextButton(onClick = { showFilterSheetDialog = false }) {
+                    Text("تطبيق", color = PeriwinklePrimary, fontWeight = FontWeight.Bold)
+                }
+            }
+        )
+    }
+
+    // "المراجع" Dialog (01:47-01:49)
+    if (showBookmarksDialog) {
+        AlertDialog(
+            onDismissRequest = { showBookmarksDialog = false },
+            containerColor = AppDialogSurface,
+            title = { Text("المراجع", color = TextPrimaryWhite, fontWeight = FontWeight.Bold) },
+            text = {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 24.dp),
+                    contentAlignment = Alignment.Center
                 ) {
-                    Text("عرض الكل", color = PeriwinklePrimary, fontWeight = FontWeight.Bold)
+                    Text("السجل فارغ.", color = TextSecondaryGrey, fontSize = 14.sp)
                 }
             },
-            dismissButton = {
-                TextButton(onClick = { showCategoriesDialog = false }) {
-                    Text("إغلاق", color = TextSecondaryGrey)
+            confirmButton = {
+                TextButton(onClick = { showBookmarksDialog = false }) {
+                    Text("إغلاق", color = PeriwinklePrimary)
+                }
+            }
+        )
+    }
+
+    // "توجه الى" Page Jump Dialog (01:51-01:54)
+    if (showJumpToPageDialog) {
+        AlertDialog(
+            onDismissRequest = { showJumpToPageDialog = false },
+            containerColor = AppDialogSurface,
+            title = { Text("توجه الى", color = TextPrimaryWhite, fontWeight = FontWeight.Bold) },
+            text = {
+                LazyColumn(modifier = Modifier.height(260.dp)) {
+                    items((1..20).toList()) { pageNum ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    currentPageNumber = pageNum
+                                    showJumpToPageDialog = false
+                                    onShowToast("الانتقال إلى الصفحة $pageNum")
+                                }
+                                .padding(vertical = 12.dp, horizontal = 8.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "$pageNum",
+                                color = if (currentPageNumber == pageNum) PeriwinklePrimary else TextPrimaryWhite,
+                                fontSize = 16.sp,
+                                fontWeight = if (currentPageNumber == pageNum) FontWeight.Bold else FontWeight.Normal
+                            )
+                            if (currentPageNumber == pageNum) {
+                                Icon(Icons.Default.Check, null, tint = PeriwinklePrimary, modifier = Modifier.size(18.dp))
+                            }
+                        }
+                        HorizontalDivider(color = AppDividerColor)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showJumpToPageDialog = false }) {
+                    Text("إلغاء", color = PeriwinklePrimary)
                 }
             }
         )

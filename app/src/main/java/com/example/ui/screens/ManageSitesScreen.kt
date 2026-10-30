@@ -22,9 +22,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Extension
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Menu
@@ -38,7 +40,6 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
@@ -60,6 +61,7 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.local.SiteEntity
+import com.example.data.source.MangaSourceAdapterRegistry
 import com.example.ui.components.SiteIconBadge
 import com.example.ui.theme.AppDialogSurface
 import com.example.ui.theme.AppDividerColor
@@ -78,7 +80,9 @@ fun ManageSitesScreen(
     onToggleSiteEnabled: (SiteEntity, Boolean) -> Unit,
     onEditSite: (SiteEntity) -> Unit,
     onDeleteSite: (SiteEntity) -> Unit,
-    onMoveSite: (SiteEntity, Boolean) -> Unit
+    onMoveSite: (SiteEntity, Boolean) -> Unit,
+    onTestConnection: (SiteEntity) -> Unit = {},
+    onOpenLastVisitedPage: (SiteEntity) -> Unit = {}
 ) {
     Column(
         modifier = Modifier
@@ -95,7 +99,6 @@ fun ManageSitesScreen(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            // Right side in RTL: Back Arrow + Title
             Row(verticalAlignment = Alignment.CenterVertically) {
                 IconButton(
                     onClick = onBackClick,
@@ -116,7 +119,6 @@ fun ManageSitesScreen(
                 )
             }
 
-            // Left side in RTL: PlaylistAdd (+≡) and Globe (🌐) icons when sites are populated (00:50)
             if (sites.isNotEmpty()) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     IconButton(
@@ -173,7 +175,6 @@ fun ManageSitesScreen(
 
                     Spacer(modifier = Modifier.height(24.dp))
 
-                    // Filled Periwinkle Pill Button: "إضافة موقع"
                     Button(
                         onClick = onAddSiteClick,
                         shape = RoundedCornerShape(26.dp),
@@ -201,7 +202,6 @@ fun ManageSitesScreen(
 
                     Spacer(modifier = Modifier.height(14.dp))
 
-                    // Outlined Pill Button: "المتصفح"
                     OutlinedButton(
                         onClick = onOpenBrowserClick,
                         shape = RoundedCornerShape(26.dp),
@@ -231,7 +231,6 @@ fun ManageSitesScreen(
                 }
             }
         } else {
-            // Populated Sites List (00:50-01:05)
             LazyColumn(
                 modifier = Modifier
                     .fillMaxSize()
@@ -245,7 +244,9 @@ fun ManageSitesScreen(
                         onEdit = { onEditSite(site) },
                         onDelete = { onDeleteSite(site) },
                         onMoveUp = { onMoveSite(site, true) },
-                        onMoveDown = { onMoveSite(site, false) }
+                        onMoveDown = { onMoveSite(site, false) },
+                        onTestConnection = { onTestConnection(site) },
+                        onOpenLastVisited = { onOpenLastVisitedPage(site) }
                     )
                     HorizontalDivider(color = AppDividerColor, thickness = 0.8.dp)
                 }
@@ -262,17 +263,15 @@ private fun SiteRowItem(
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     onMoveUp: () -> Unit,
-    onMoveDown: () -> Unit
+    onMoveDown: () -> Unit,
+    onTestConnection: () -> Unit,
+    onOpenLastVisited: () -> Unit
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
+    val capabilities = remember(site.id, site.url, site.adapterType) {
+        MangaSourceAdapterRegistry.getCapabilitiesForSite(site)
+    }
 
-    // Exact visual layout from 00:50 & 01:04:
-    // In RTL (Right to Left):
-    // 1. Drag handle (≡) on the far right
-    // 2. Switch toggle
-    // 3. Site Icon Badge (M / X / Globe)
-    // 4. Site Name + URL below it
-    // 5. Three-dots menu (⋮) on the far left
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -337,6 +336,16 @@ private fun SiteRowItem(
                     modifier = Modifier.fillMaxWidth()
                 )
             }
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = if (capabilities.supportsChapterDownload) {
+                    "يدعم القارئ المدمج وتنزيل الفصول"
+                } else {
+                    "وضع التصفح المباشر (WebView)"
+                },
+                color = if (capabilities.supportsChapterDownload) Color(0xFF81C784) else TextSecondaryGrey,
+                fontSize = 11.sp
+            )
         }
 
         Box {
@@ -362,6 +371,22 @@ private fun SiteRowItem(
                     onClick = {
                         menuExpanded = false
                         onOpen()
+                    }
+                )
+                DropdownMenuItem(
+                    text = { Text("آخر صفحة تمت زيارتها", color = TextPrimaryWhite) },
+                    leadingIcon = { Icon(Icons.Default.History, null, tint = PeriwinklePrimary) },
+                    onClick = {
+                        menuExpanded = false
+                        onOpenLastVisited()
+                    }
+                )
+                DropdownMenuItem(
+                    text = { Text("فحص حالة الاتصال", color = TextPrimaryWhite) },
+                    leadingIcon = { Icon(Icons.Default.CheckCircle, null, tint = Color(0xFF81C784)) },
+                    onClick = {
+                        menuExpanded = false
+                        onTestConnection()
                     }
                 )
                 DropdownMenuItem(

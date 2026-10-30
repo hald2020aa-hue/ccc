@@ -9,27 +9,43 @@ data class MangaChapter(
     val dateText: String,
     val chapterUrl: String = "",
     val pageImageUrls: List<String> = emptyList(),
+    val localPagePaths: List<String> = emptyList(),
     val pageCount: Int = 0,
     val isDownloaded: Boolean = false,
-    val isRead: Boolean = false
+    val downloadStatus: String = "", // "", "QUEUED", "DOWNLOADING", "COMPLETED", "INCOMPLETE", "FAILED", "CANCELLED"
+    val isRead: Boolean = false,
+    val lastReadPage: Int = 0,
+    val lastReadTimeText: String = "",
+    val chapterKey: String = ""
 )
 
 data class MangaWork(
     val id: String,
     val title: String,
+    val subtitle: String = "",
     val mangaUrl: String = "",
     val arabicBannerTitle: String = "",
+    val sourceId: Long = 0L,
     val siteName: String,
     val siteUrl: String,
-    val siteIconKey: String,
-    val status: String = "مستمرة",
+    val siteIconKey: String = "globe",
+    val status: String = "OnGoing",
     val type: String = "مانهوا",
-    val rating: String = "0.0",
+    val rating: String = "4.5",
+    val releaseYear: String = "2025",
+    val author: String = "",
+    val artist: String = "",
+    val viewsText: String = "",
     val chaptersCount: Int = 0,
     val genres: List<String> = emptyList(),
     val description: String = "",
+    val synopsis: String = description,
     val coverStyleIndex: Int = 0,
     val coverImageUrl: String? = null,
+    val coverUrl: String? = coverImageUrl,
+    val localCoverPath: String = "",
+    val isFromLocalStorage: Boolean = false,
+    val storageSizeBytes: Long = 0L,
     val chapters: List<MangaChapter> = emptyList(),
     val isDetailsLoaded: Boolean = false
 )
@@ -38,17 +54,23 @@ object MangaCatalogData {
 
     val siteCategoryChips: List<String> = listOf(
         "التصنيفات",
-        "أكشن",
-        "إثارة",
+        "18+",
+        "Fantasy",
+        "إدارة المناطق",
+        "إنتقام",
         "إيسيكاي",
+        "ابراج",
+        "اتشى",
+        "اثاره",
+        "أكشن",
         "بطل غير إعتيادي",
         "خيال",
         "دموي",
         "نظام",
         "سحر",
-        "مغامرات",
-        "فنون قتال",
-        "مانهوا"
+        "دراما",
+        "رومانسي",
+        "فنون قتاليه"
     )
 
     // Empty as requested: user adds their own manga sites manually

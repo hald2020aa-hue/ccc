@@ -10,15 +10,19 @@ import com.example.data.MangaChapter
 import com.example.data.MangaWork
 import com.example.data.local.AppDatabase
 import com.example.data.local.DownloadTaskEntity
+import com.example.data.local.DownloadedChapterEntity
+import com.example.data.local.DownloadedWorkEntity
 import com.example.data.local.FavoriteCategoryEntity
 import com.example.data.local.FavoriteEntity
 import com.example.data.local.HistoryEntity
+import com.example.data.local.ReadingProgressEntity
 import com.example.data.local.SavedWorkEntity
 import com.example.data.local.SiteEntity
 import com.example.data.preferences.UserSettings
 import com.example.data.preferences.UserSettingsDataStore
 import com.example.data.repository.AppRepository
 import com.example.data.repository.StorageStats
+import com.example.data.source.SourceCapabilities
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -68,7 +72,7 @@ sealed class AddSiteDialogState {
     ) : AddSiteDialogState()
 }
 
-class MainViewModel(private val repository: AppRepository) : ViewModel() {
+class MainViewModel(val repository: AppRepository) : ViewModel() {
 
     val sites: StateFlow<List<SiteEntity>> = repository.allSites
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -90,6 +94,17 @@ class MainViewModel(private val repository: AppRepository) : ViewModel() {
 
     val downloadTasks: StateFlow<List<DownloadTaskEntity>> = repository.allDownloadTasks
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val downloadedWorks: StateFlow<List<DownloadedWorkEntity>> = repository.allDownloadedWorks
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val downloadedChapters: StateFlow<List<DownloadedChapterEntity>> = repository.allDownloadedChapters
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val readingProgressList: StateFlow<List<ReadingProgressEntity>> = repository.allReadingProgress
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val isDownloadsPaused: StateFlow<Boolean> = repository.mangaDownloadManager.isAllPaused
 
     val settings: StateFlow<UserSettings> = repository.settingsFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), UserSettings())
@@ -156,6 +171,32 @@ class MainViewModel(private val repository: AppRepository) : ViewModel() {
 
     init {
         refreshStorageStats()
+        // Sync downloadedChapters and readingProgress from Room into UI maps
+        viewModelScope.launch {
+            repository.allDownloadedChapters.collect { chList ->
+                val grouped = chList
+                    .filter { it.status == "COMPLETED" }
+                    .groupBy { it.workId }
+                    .mapValues { (_, list) -> list.map { it.chapterNumber }.toSet() }
+                _downloadedChaptersMap.value = grouped
+            }
+        }
+        viewModelScope.launch {
+            repository.allReadingProgress.collect { progList ->
+                val readGrouped = progList
+                    .groupBy { it.workId }
+                    .mapValues { (_, list) -> list.map { it.chapterNumber }.toSet() }
+                _readChaptersMap.value = readGrouped
+
+                val latestByWork = progList
+                    .groupBy { it.workId }
+                    .mapValues { (_, list) ->
+                        val latest = list.maxByOrNull { it.lastReadAt }
+                        if (latest != null) latest.chapterNumber to latest.lastPageIndex else (1 to 0)
+                    }
+                _readingProgressMap.value = latestByWork
+            }
+        }
         viewModelScope.launch {
             repository.settingsFlow.collect { userSettings ->
                 if (_screenBackStack.value.isEmpty() && _currentScreen.value == AppScreen.STORAGE) {
@@ -218,6 +259,12 @@ class MainViewModel(private val repository: AppRepository) : ViewModel() {
     fun updateBrowserPageState(url: String, title: String) {
         if (url.isNotBlank()) _browserUrl.value = url
         if (title.isNotBlank()) _browserTitle.value = title
+        val currentSite = _selectedSite.value
+        if (currentSite.id != 0L && url.startsWith("http")) {
+            viewModelScope.launch {
+                repository.updateSiteLastVisitedUrl(currentSite, url)
+            }
+        }
     }
 
     fun recordPageVisit(title: String, url: String, siteName: String = "المتصفح") {
@@ -227,51 +274,149 @@ class MainViewModel(private val repository: AppRepository) : ViewModel() {
         }
     }
 
-    // Native Site Catalog, Manga Details, and Chapter Reader Navigation (matching 00:02 - 00:52)
+    fun getSourceCapabilities(site: SiteEntity): SourceCapabilities =
+        repository.getSourceCapabilities(site)
+
+    fun testSiteConnection(site: SiteEntity) {
+        viewModelScope.launch {
+            showToast("جار فحص الاتصال بـ ${site.name}...")
+            val result = repository.testSourceConnection(site.url)
+            showToast("${site.name}: ${result.message}")
+        }
+    }
+
+    fun openSiteLastVisitedPage(site: SiteEntity) {
+        val targetUrl = site.lastVisitedUrl.ifBlank { site.url }
+        openBrowserWithUrl(targetUrl, site.name)
+    }
+
+    // Native Site Catalog, Manga Details, and Chapter Reader Navigation
     fun openSiteCatalog(site: SiteEntity) {
         _selectedSite.value = site
         navigateTo(AppScreen.SITE_CATALOG)
     }
 
     fun openMangaDetails(work: MangaWork) {
-        _selectedWork.value = work
-        if (work.chapters.isNotEmpty()) {
-            _selectedChapter.value = work.chapters.first()
+        viewModelScope.launch {
+            // Merge any locally downloaded chapters for this work so offline/downloaded badges work seamlessly
+            val localWorkEntity = repository.dao.getDownloadedWorkById(work.id)
+            val mergedWork = if (work.isFromLocalStorage && localWorkEntity != null) {
+                repository.buildOfflineMangaWorkFromEntity(localWorkEntity)
+            } else if (localWorkEntity != null) {
+                val offlineBuilt = repository.buildOfflineMangaWorkFromEntity(localWorkEntity)
+                val offlineChByNumber = offlineBuilt.chapters.associateBy { it.number }
+                val mergedChapters = if (work.chapters.isEmpty()) {
+                    offlineBuilt.chapters
+                } else {
+                    work.chapters.map { ch ->
+                        val localCh = offlineChByNumber[ch.number]
+                        if (localCh != null && localCh.localPagePaths.isNotEmpty()) {
+                            ch.copy(
+                                localPagePaths = localCh.localPagePaths,
+                                downloadStatus = localCh.downloadStatus,
+                                lastReadPage = localCh.lastReadPage,
+                                lastReadTimeText = localCh.lastReadTimeText,
+                                chapterKey = localCh.chapterKey
+                            )
+                        } else {
+                            ch
+                        }
+                    }
+                }
+                work.copy(
+                    localCoverPath = localWorkEntity.localCoverPath.ifBlank { work.localCoverPath },
+                    storageSizeBytes = localWorkEntity.totalStorageBytes,
+                    chapters = mergedChapters
+                )
+            } else {
+                work
+            }
+
+            _selectedWork.value = mergedWork
+            if (mergedWork.chapters.isNotEmpty()) {
+                _selectedChapter.value = mergedWork.chapters.first()
+            }
+            recordPageVisit(
+                title = mergedWork.title,
+                url = mergedWork.mangaUrl.ifBlank { "${mergedWork.siteUrl}/series/${mergedWork.id}" },
+                siteName = mergedWork.siteName
+            )
+            navigateTo(AppScreen.MANGA_DETAILS)
         }
-        recordPageVisit(
-            title = work.title,
-            url = work.mangaUrl.ifBlank { "${work.siteUrl}/series/${work.id}" },
-            siteName = work.siteName
-        )
-        navigateTo(AppScreen.MANGA_DETAILS)
+    }
+
+    fun openDownloadedWorkFromStorage(entity: DownloadedWorkEntity) {
+        viewModelScope.launch {
+            val offlineWork = repository.buildOfflineMangaWorkFromEntity(entity)
+            _selectedWork.value = offlineWork
+            if (offlineWork.chapters.isNotEmpty()) {
+                _selectedChapter.value = offlineWork.chapters.first()
+            }
+            navigateTo(AppScreen.MANGA_DETAILS)
+        }
     }
 
     fun openMangaChapterReader(work: MangaWork, chapter: MangaChapter) {
-        _selectedWork.value = work
-        _selectedChapter.value = chapter
+        viewModelScope.launch {
+            // Check if this chapter has locally downloaded files on disk
+            val chapterKey = "${work.id}_ch_${chapter.number}"
+            val localChEntity = repository.dao.getDownloadedChapterByKey(chapterKey)
+            val effectiveChapter = if (localChEntity != null) {
+                val paths = repository.localStorageManager.decodeLocalPathsJson(localChEntity.localPagePathsJson)
+                val savedProgress = repository.readingProgressRepository.getChapterProgress(work.id, chapter.number)
+                chapter.copy(
+                    localPagePaths = paths,
+                    downloadStatus = localChEntity.status,
+                    pageCount = localChEntity.totalPages.coerceAtLeast(paths.size).coerceAtLeast(chapter.pageCount),
+                    lastReadPage = savedProgress?.lastPageIndex ?: chapter.lastReadPage,
+                    chapterKey = chapterKey
+                )
+            } else {
+                val savedProgress = repository.readingProgressRepository.getChapterProgress(work.id, chapter.number)
+                chapter.copy(
+                    lastReadPage = savedProgress?.lastPageIndex ?: chapter.lastReadPage,
+                    chapterKey = chapterKey
+                )
+            }
 
-        val currentReadMap = _readChaptersMap.value.toMutableMap()
-        val readSet = currentReadMap[work.id]?.toMutableSet() ?: mutableSetOf()
-        readSet.add(chapter.number)
-        currentReadMap[work.id] = readSet
-        _readChaptersMap.value = currentReadMap
+            _selectedWork.value = work
+            _selectedChapter.value = effectiveChapter
 
-        val currentProgressMap = _readingProgressMap.value.toMutableMap()
-        val existingPage = currentProgressMap[work.id]?.takeIf { it.first == chapter.number }?.second ?: 0
-        currentProgressMap[work.id] = chapter.number to existingPage
-        _readingProgressMap.value = currentProgressMap
+            val currentReadMap = _readChaptersMap.value.toMutableMap()
+            val readSet = currentReadMap[work.id]?.toMutableSet() ?: mutableSetOf()
+            readSet.add(effectiveChapter.number)
+            currentReadMap[work.id] = readSet
+            _readChaptersMap.value = currentReadMap
 
-        recordPageVisit(
-            title = "${work.title} - ${chapter.title}",
-            url = chapter.chapterUrl.ifBlank { "${work.siteUrl}/series/${work.id}/chapter-${chapter.number}" },
-            siteName = work.siteName
-        )
-        navigateTo(AppScreen.MANGA_READER)
+            val resumePage = effectiveChapter.lastReadPage.coerceAtLeast(0)
+            val currentProgressMap = _readingProgressMap.value.toMutableMap()
+            currentProgressMap[work.id] = effectiveChapter.number to resumePage
+            _readingProgressMap.value = currentProgressMap
+
+            repository.readingProgressRepository.saveProgress(
+                workId = work.id,
+                workTitle = work.title,
+                chapterId = effectiveChapter.id,
+                chapterNumber = effectiveChapter.number,
+                chapterTitle = effectiveChapter.title,
+                pageIndex = resumePage,
+                totalPages = effectiveChapter.pageCount,
+                scrollOffset = 0
+            )
+
+            recordPageVisit(
+                title = "${work.title} - ${effectiveChapter.title}",
+                url = effectiveChapter.chapterUrl.ifBlank { "${work.siteUrl}/series/${work.id}/chapter-${effectiveChapter.number}" },
+                siteName = work.siteName
+            )
+            navigateTo(AppScreen.MANGA_READER)
+        }
     }
 
-    fun saveReadingProgress(work: MangaWork, chapter: MangaChapter, pageIndex: Int) {
+    fun saveReadingProgress(work: MangaWork, chapter: MangaChapter, pageIndex: Int, scrollOffset: Int = 0) {
+        val safePage = pageIndex.coerceAtLeast(0)
         val currentProgressMap = _readingProgressMap.value.toMutableMap()
-        currentProgressMap[work.id] = chapter.number to pageIndex.coerceAtLeast(0)
+        currentProgressMap[work.id] = chapter.number to safePage
         _readingProgressMap.value = currentProgressMap
 
         val currentReadMap = _readChaptersMap.value.toMutableMap()
@@ -279,11 +424,35 @@ class MainViewModel(private val repository: AppRepository) : ViewModel() {
         readSet.add(chapter.number)
         currentReadMap[work.id] = readSet
         _readChaptersMap.value = currentReadMap
+
+        viewModelScope.launch {
+            repository.readingProgressRepository.saveProgress(
+                workId = work.id,
+                workTitle = work.title,
+                chapterId = chapter.id,
+                chapterNumber = chapter.number,
+                chapterTitle = chapter.title,
+                pageIndex = safePage,
+                totalPages = chapter.pageCount,
+                scrollOffset = scrollOffset
+            )
+        }
+    }
+
+    fun getFormattedResumeLabel(workId: String): String {
+        val progList = readingProgressList.value.filter { it.workId == workId }
+        val latest = progList.maxByOrNull { it.lastReadAt } ?: return ""
+        return repository.readingProgressRepository.formatResumeText(latest)
     }
 
     fun resumeReadingCurrentOrLastWork() {
         val work = _selectedWork.value
         if (work.id.isBlank() && work.mangaUrl.isBlank()) {
+            val firstDownloaded = downloadedWorks.value.firstOrNull()
+            if (firstDownloaded != null) {
+                openDownloadedWorkFromStorage(firstDownloaded)
+                return
+            }
             val firstSite = enabledSites.value.firstOrNull()
             if (firstSite != null) {
                 openSiteCatalog(firstSite)
@@ -323,28 +492,63 @@ class MainViewModel(private val repository: AppRepository) : ViewModel() {
             _downloadedChaptersMap.value = currentMap
 
             showToast(toastMsg)
-            // Persist offline package for up to 10 chapters immediately so DownloadsScreen & StorageStats update
-            chapters.take(10).forEach { ch ->
-                repository.downloadMangaChapterOffline(work, ch, quality)
-            }
-            if (chapters.size > 10) {
-                repository.saveWebPageToStorage(
-                    title = "${work.title} (${chapters.size} فصل)",
-                    url = "${work.siteUrl}/series/${work.id}"
-                )
-            }
+            repository.mangaDownloadManager.enqueueChaptersDownload(
+                work = work,
+                chapters = chapters,
+                quality = quality
+            )
+            delay(500)
             refreshStorageStats()
         }
     }
 
-    fun saveMangaWorkToStorage(work: MangaWork) {
-        viewModelScope.launch {
-            repository.saveWebPageToStorage(
-                title = work.title,
-                url = "${work.siteUrl}/series/${work.id}"
+    fun saveWholeMangaFromCatalog(work: MangaWork) {
+        val chaptersToDownload = if (work.chapters.isNotEmpty()) {
+            work.chapters
+        } else {
+            listOf(
+                MangaChapter(
+                    id = "${work.id}-ch-1",
+                    number = 1,
+                    title = "الفصل 1",
+                    dateText = "الآن",
+                    chapterUrl = "${work.mangaUrl.ifBlank { work.siteUrl }}/1/",
+                    pageCount = 12
+                )
             )
+        }
+        downloadChaptersForWork(
+            work = work.copy(chapters = chaptersToDownload),
+            chapters = chaptersToDownload,
+            toastMsg = "بدأ التنزيل 😭"
+        )
+    }
+
+    fun saveMangaWorkToStorage(work: MangaWork) {
+        saveWholeMangaFromCatalog(work)
+    }
+
+    fun deleteDownloadedWorkFromStorage(workId: String) {
+        viewModelScope.launch {
+            repository.deleteDownloadedWork(workId)
             refreshStorageStats()
-            showToast("تم حفظ ${work.title} في التخزين")
+            showToast("تم حذف المانجا وجميع ملفاتها المحلية من التخزين")
+            if (_currentScreen.value == AppScreen.MANGA_DETAILS && _selectedWork.value.id == workId) {
+                navigateBack()
+            }
+        }
+    }
+
+    fun deleteSingleDownloadedChapter(work: MangaWork, chapter: MangaChapter) {
+        viewModelScope.launch {
+            repository.deleteDownloadedChapter(work.id, chapter.number)
+            refreshStorageStats()
+            // Refresh selectedWork if currently viewing it
+            val updatedWorkEntity = repository.dao.getDownloadedWorkById(work.id)
+            if (updatedWorkEntity != null && work.isFromLocalStorage) {
+                _selectedWork.value = repository.buildOfflineMangaWorkFromEntity(updatedWorkEntity)
+            }
+            showToast("تم حذف ${chapter.title} من التخزين المحلي")
         }
     }
 
@@ -637,6 +841,33 @@ class MainViewModel(private val repository: AppRepository) : ViewModel() {
         }
     }
 
+    fun cancelDownloadTask(task: DownloadTaskEntity) {
+        viewModelScope.launch {
+            repository.cancelDownloadTask(task)
+            showToast("تم إلغاء التنزيل")
+        }
+    }
+
+    fun togglePauseAllDownloads() {
+        val paused = !isDownloadsPaused.value
+        repository.mangaDownloadManager.setAllPaused(paused)
+        showToast(if (paused) "تم إيقاف جميع التنزيلات مؤقتاً" else "تم استئناف التنزيلات")
+    }
+
+    fun cancelAllDownloads() {
+        viewModelScope.launch {
+            repository.cancelAllActiveDownloads()
+            showToast("تم إلغاء جميع التنزيلات الجارية")
+        }
+    }
+
+    fun clearDownloadHistory() {
+        viewModelScope.launch {
+            repository.clearDownloadHistoryRecords()
+            showToast("تم حذف سجل التنزيلات")
+        }
+    }
+
     fun retryDownloadTask(task: DownloadTaskEntity) {
         viewModelScope.launch {
             repository.retryFailedDownloadTask(task)
@@ -646,21 +877,43 @@ class MainViewModel(private val repository: AppRepository) : ViewModel() {
     }
 
     fun openDownloadedTaskInReader(task: DownloadTaskEntity) {
-        // Parse manga://{workId}/chapter/{chapterNumber} if present
-        if (task.url.startsWith("manga://")) {
-            val path = task.url.removePrefix("manga://")
-            val workId = path.substringBefore("/chapter/")
-            val chNum = path.substringAfter("/chapter/").toIntOrNull() ?: 1
+        viewModelScope.launch {
+            val workId = if (task.workId.isNotBlank()) {
+                task.workId
+            } else if (task.url.startsWith("manga://")) {
+                task.url.removePrefix("manga://").substringBefore("/chapter/")
+            } else {
+                ""
+            }
+            val chNum = if (task.chapterNumber > 0) {
+                task.chapterNumber
+            } else if (task.url.startsWith("manga://")) {
+                task.url.substringAfter("/chapter/").toIntOrNull() ?: 1
+            } else {
+                1
+            }
+
+            if (workId.isNotBlank()) {
+                val downloadedWorkEntity = repository.dao.getDownloadedWorkById(workId)
+                if (downloadedWorkEntity != null) {
+                    val offlineWork = repository.buildOfflineMangaWorkFromEntity(downloadedWorkEntity)
+                    val targetChapter = offlineWork.chapters.find { it.number == chNum }
+                        ?: offlineWork.chapters.firstOrNull()
+                    if (targetChapter != null) {
+                        openMangaChapterReader(offlineWork, targetChapter)
+                        return@launch
+                    }
+                    openMangaDetails(offlineWork)
+                    return@launch
+                }
+            }
+
             val allWorks = MangaCatalogData.defaultAddedSites.flatMap { MangaCatalogData.getCatalogForSite(it) } +
                 MangaCatalogData.storageLibraryWorks
             val matchedWork = allWorks.find { it.id == workId } ?: _selectedWork.value
             val matchedChapter = matchedWork.chapters.find { it.number == chNum }
                 ?: matchedWork.chapters.firstOrNull()
                 ?: _selectedChapter.value
-            openMangaChapterReader(matchedWork, matchedChapter)
-        } else {
-            val matchedWork = _selectedWork.value
-            val matchedChapter = matchedWork.chapters.firstOrNull() ?: _selectedChapter.value
             openMangaChapterReader(matchedWork, matchedChapter)
         }
     }
@@ -669,7 +922,7 @@ class MainViewModel(private val repository: AppRepository) : ViewModel() {
         viewModelScope.launch {
             val ok = repository.clearAppCache()
             refreshStorageStats()
-            showToast(if (ok) "تم مسح ذاكرة التخزين المؤقتة" else "تعذر مسح ذاكرة التخزين المؤقتة")
+            showToast(if (ok) "تم مسح ذاكرة التخزين المؤقتة (مع الحفاظ على الفصول المنزلة)" else "تعذر مسح ذاكرة التخزين المؤقتة")
         }
     }
 
@@ -703,7 +956,7 @@ class MainViewModel(private val repository: AppRepository) : ViewModel() {
     fun createBackup() {
         viewModelScope.launch {
             try {
-                val path = repository.exportBackupJson()
+                repository.exportBackupJson()
                 refreshStorageStats()
                 showToast("تم حفظ النسخة الاحتياطية في التخزين")
             } catch (e: Exception) {

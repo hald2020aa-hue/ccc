@@ -12,9 +12,12 @@ import androidx.room.RoomDatabase
         FavoriteCategoryEntity::class,
         HistoryEntity::class,
         SavedWorkEntity::class,
-        DownloadTaskEntity::class
+        DownloadTaskEntity::class,
+        DownloadedWorkEntity::class,
+        DownloadedChapterEntity::class,
+        ReadingProgressEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {

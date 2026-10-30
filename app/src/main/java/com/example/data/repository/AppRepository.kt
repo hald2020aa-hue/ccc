@@ -7,16 +7,23 @@ import android.net.Uri
 import android.os.Environment
 import android.os.StatFs
 import android.provider.OpenableColumns
-import android.webkit.WebStorage
+import com.example.data.MangaChapter
+import com.example.data.MangaWork
+import com.example.data.download.MangaDownloadManager
 import com.example.data.local.AppDao
 import com.example.data.local.DownloadTaskEntity
+import com.example.data.local.DownloadedChapterEntity
+import com.example.data.local.DownloadedWorkEntity
 import com.example.data.local.FavoriteCategoryEntity
 import com.example.data.local.FavoriteEntity
 import com.example.data.local.HistoryEntity
+import com.example.data.local.ReadingProgressEntity
 import com.example.data.local.SavedWorkEntity
 import com.example.data.local.SiteEntity
 import com.example.data.preferences.UserSettings
 import com.example.data.preferences.UserSettingsDataStore
+import com.example.data.source.SourceCapabilities
+import com.example.data.storage.LocalStorageManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
@@ -50,7 +57,7 @@ data class SiteMetadataResult(
 
 class AppRepository(
     private val context: Context,
-    private val dao: AppDao,
+    val dao: AppDao,
     private val settingsDataStore: UserSettingsDataStore
 ) {
     private val httpClient = OkHttpClient.Builder()
@@ -59,6 +66,11 @@ class AppRepository(
         .followRedirects(true)
         .build()
 
+    val localStorageManager = LocalStorageManager(context)
+    val sourceRepository = SourceRepository(dao, httpClient)
+    val readingProgressRepository = ReadingProgressRepository(dao)
+    val mangaDownloadManager = MangaDownloadManager(dao, localStorageManager, httpClient)
+
     val allSites: Flow<List<SiteEntity>> = dao.getAllSites()
     val enabledSites: Flow<List<SiteEntity>> = dao.getEnabledSites()
     val allFavorites: Flow<List<FavoriteEntity>> = dao.getAllFavorites()
@@ -66,18 +78,12 @@ class AppRepository(
     val allHistory: Flow<List<HistoryEntity>> = dao.getAllHistory()
     val allSavedWorks: Flow<List<SavedWorkEntity>> = dao.getAllSavedWorks()
     val allDownloadTasks: Flow<List<DownloadTaskEntity>> = dao.getAllDownloadTasks()
+    val allDownloadedWorks: Flow<List<DownloadedWorkEntity>> = dao.getAllDownloadedWorks()
+    val allDownloadedChapters: Flow<List<DownloadedChapterEntity>> = dao.getAllDownloadedChapters()
+    val allReadingProgress: Flow<List<ReadingProgressEntity>> = dao.getAllReadingProgress()
     val settingsFlow: Flow<UserSettings> = settingsDataStore.settingsFlow
 
-    fun getSavedDirectory(): File {
-        val extDir = context.getExternalFilesDir("saved")
-        if (extDir != null) {
-            if (!extDir.exists()) extDir.mkdirs()
-            return extDir
-        }
-        val internalDir = File(context.filesDir, "saved")
-        if (!internalDir.exists()) internalDir.mkdirs()
-        return internalDir
-    }
+    fun getSavedDirectory(): File = localStorageManager.getRootSavedDir()
 
     fun getDisplayStoragePath(): String {
         val rawPath = getSavedDirectory().absolutePath
@@ -99,6 +105,15 @@ class AppRepository(
         val caps = cm.getNetworkCapabilities(network) ?: return false
         return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
     }
+
+    fun getSourceCapabilities(site: SiteEntity): SourceCapabilities =
+        sourceRepository.getCapabilities(site)
+
+    suspend fun testSourceConnection(url: String): SourceConnectionTestResult =
+        sourceRepository.testSourceConnection(url)
+
+    suspend fun updateSiteLastVisitedUrl(site: SiteEntity, url: String) =
+        sourceRepository.updateLastVisitedUrl(site, url)
 
     suspend fun normalizeAndResolveSite(rawInput: String): SiteMetadataResult = withContext(Dispatchers.IO) {
         val trimmed = rawInput.trim()
@@ -227,26 +242,11 @@ class AppRepository(
     }
 
     suspend fun addSite(name: String, url: String, domain: String, iconKey: String): Long {
-        val displayTitle = if (domain.contains("mangalik") && name.contains("Mangalek")) {
-            "مانجا ليك"
-        } else {
-            name.trim().ifEmpty { domain }
-        }
-        val existingCount = dao.getAllSitesOnce().size
-        return dao.insertSite(
-            SiteEntity(
-                name = displayTitle,
-                url = url,
-                domain = domain,
-                isEnabled = true,
-                sortOrder = existingCount,
-                iconKey = iconKey
-            )
-        )
+        return sourceRepository.addSource(name, url, domain, iconKey)
     }
 
-    suspend fun updateSite(site: SiteEntity) = dao.updateSite(site)
-    suspend fun deleteSite(site: SiteEntity) = dao.deleteSite(site)
+    suspend fun updateSite(site: SiteEntity) = sourceRepository.updateSource(site)
+    suspend fun deleteSite(site: SiteEntity) = sourceRepository.deleteSource(site)
 
     suspend fun addHistory(title: String, url: String, siteName: String) {
         if (url.isBlank() || url == "about:blank") return
@@ -292,16 +292,20 @@ class AppRepository(
 
     suspend fun calculateStorageStats(): StorageStats = withContext(Dispatchers.IO) {
         val works = dao.getAllSavedWorksOnce()
+        val downloadedWorks = dao.getAllDownloadedWorksOnce()
+        val offlineMangaBytes = downloadedWorks.sumOf { it.totalStorageBytes }
+            .coerceAtLeast(localStorageManager.calculateDownloadedMangaBytes())
+
         val downloadsBytes = works.filter { it.fileType == "DOWNLOAD" || it.fileType == "IMPORT" }
-            .sumOf { it.fileSizeBytes }
+            .sumOf { it.fileSizeBytes } + offlineMangaBytes
         val pagesBytes = works.filter { it.fileType == "PAGE" }
             .sumOf { it.fileSizeBytes }
 
         val dbFile = context.getDatabasePath("manga_sites_reader.db")
         val dbBytes = if (dbFile.exists()) dbFile.length() else 0L
-        val otherBytes = 7_549_747L + dbBytes // ~7.2 MB matching app binary + metadata footprint
+        val otherBytes = 7_549_747L + dbBytes
 
-        val cacheDirSize = getFolderSize(context.cacheDir)
+        val cacheDirSize = localStorageManager.getFolderSizeBytes(context.cacheDir)
         val effectiveCacheBytes = if (cacheDirSize > 0L) cacheDirSize else 209_715L
 
         val statFs = try {
@@ -323,26 +327,77 @@ class AppRepository(
         )
     }
 
-    private fun getFolderSize(dir: File?): Long {
-        if (dir == null || !dir.exists()) return 0L
-        var size = 0L
-        dir.listFiles()?.forEach { file ->
-            size += if (file.isDirectory) getFolderSize(file) else file.length()
-        }
-        return size
-    }
+    /**
+     * Clears ONLY WebView and temporary HTTP caches, strictly preserving downloaded manga chapters.
+     */
+    suspend fun clearAppCache(): Boolean = localStorageManager.clearWebViewBrowsingDataOnly()
 
-    suspend fun clearAppCache(): Boolean = withContext(Dispatchers.IO) {
-        try {
-            context.cacheDir?.listFiles()?.forEach { it.deleteRecursively() }
-            try {
-                WebStorage.getInstance().deleteAllData()
-            } catch (_: Exception) {
+    suspend fun buildOfflineMangaWorkFromEntity(entity: DownloadedWorkEntity): MangaWork = withContext(Dispatchers.IO) {
+        val downloadedChList = dao.getDownloadedChaptersForWorkOnce(entity.workId)
+        val progressList = dao.getReadingProgressForWorkOnce(entity.workId)
+        val progressByKey = progressList.associateBy { it.chapterKey }
+
+        val chapters = downloadedChList.sortedByDescending { it.chapterNumber }.map { chEntity ->
+            val localPaths = localStorageManager.decodeLocalPathsJson(chEntity.localPagePathsJson)
+            val progress = progressByKey[chEntity.chapterKey]
+                ?: progressList.find { it.chapterNumber == chEntity.chapterNumber }
+            val timeText = if (progress != null) {
+                readingProgressRepository.formatResumeText(progress)
+            } else {
+                ""
             }
-            true
-        } catch (_: Exception) {
-            false
+            MangaChapter(
+                id = chEntity.chapterId,
+                number = chEntity.chapterNumber,
+                title = chEntity.chapterTitle,
+                dateText = if (chEntity.status == "COMPLETED") "محفوظ محلياً" else "غير مكتمل",
+                chapterUrl = chEntity.chapterUrl,
+                pageCount = chEntity.totalPages.coerceAtLeast(localPaths.size).coerceAtLeast(1),
+                pageImageUrls = emptyList(),
+                localPagePaths = localPaths,
+                isDownloaded = chEntity.status == "COMPLETED",
+                downloadStatus = chEntity.status,
+                lastReadPage = progress?.lastPageIndex ?: -1,
+                lastReadTimeText = timeText,
+                chapterKey = chEntity.chapterKey
+            )
         }
+
+        val genresList = entity.genresCsv
+            .split(",")
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+
+        val resolvedCover = entity.remoteCoverUrl.ifBlank { entity.coverUrl }
+
+        MangaWork(
+            id = entity.workId,
+            title = entity.title,
+            subtitle = entity.subtitle,
+            siteName = entity.sourceName.ifBlank { "التخزين" },
+            siteUrl = entity.sourceUrl,
+            siteIconKey = entity.siteIconKey,
+            mangaUrl = entity.mangaUrl,
+            coverImageUrl = resolvedCover,
+            coverUrl = resolvedCover,
+            rating = entity.rating,
+            status = entity.status,
+            type = entity.type,
+            releaseYear = "2025",
+            author = entity.author,
+            artist = entity.author,
+            viewsText = "محلي",
+            chaptersCount = maxOf(entity.totalChaptersOnSite, chapters.size),
+            genres = genresList,
+            description = entity.synopsis,
+            synopsis = entity.synopsis,
+            chapters = chapters,
+            sourceId = entity.sourceId,
+            localCoverPath = entity.localCoverPath,
+            isFromLocalStorage = true,
+            storageSizeBytes = entity.totalStorageBytes,
+            isDetailsLoaded = true
+        )
     }
 
     suspend fun saveWebPageToStorage(title: String, url: String): Result<SavedWorkEntity> = withContext(Dispatchers.IO) {
@@ -463,125 +518,52 @@ class AppRepository(
     }
 
     suspend fun downloadMangaChapterOffline(
-        work: com.example.data.MangaWork,
-        chapter: com.example.data.MangaChapter,
+        work: MangaWork,
+        chapter: MangaChapter,
         quality: String = "عالية (الأصلية)"
-    ): Result<DownloadTaskEntity> = withContext(Dispatchers.IO) {
-        val taskTitle = "${work.title} - ${chapter.title}"
-        val taskUrl = "manga://${work.id}/chapter/${chapter.number}"
-        val initialTask = DownloadTaskEntity(
-            title = taskTitle,
-            url = taskUrl,
-            status = "DOWNLOADING",
-            progress = 25
-        )
-        val taskId = dao.insertDownloadTask(initialTask)
-        try {
-            val savedDir = getSavedDirectory()
-            val safeWorkId = work.id.replace(Regex("[^a-zA-Z0-9_-]"), "_")
-            val fileName = "offline_chapter_${safeWorkId}_${chapter.number}.json"
-            val targetFile = File(savedDir, fileName)
-
-            val pagesJson = JSONArray()
-            val totalPages = chapter.pageCount.coerceAtLeast(8)
-            for (pageIndex in 0 until totalPages) {
-                pagesJson.put(
-                    JSONObject().apply {
-                        put("pageNumber", pageIndex + 1)
-                        put("workId", work.id)
-                        put("chapterNumber", chapter.number)
-                        put("quality", quality)
-                        put("offlineReady", true)
-                    }
-                )
-            }
-
-            val payload = JSONObject().apply {
-                put("workId", work.id)
-                put("workTitle", work.title)
-                put("siteName", work.siteName)
-                put("siteUrl", work.siteUrl)
-                put("chapterId", chapter.id)
-                put("chapterNumber", chapter.number)
-                put("chapterTitle", chapter.title)
-                put("quality", quality)
-                put("pageCount", totalPages)
-                put("downloadedAt", System.currentTimeMillis())
-                put("pages", pagesJson)
-                // Pad offline package payload to realistic chapter metadata size
-                put("offlineSignature", "OFFLINE_MANGA_PACKAGE_${work.id}_${chapter.number}_".repeat(45))
-            }
-
-            dao.updateDownloadTask(initialTask.copy(id = taskId, progress = 70))
-            targetFile.writeText(payload.toString(2), Charsets.UTF_8)
-
-            val simulatedImageBytes = (totalPages * 145_000L)
-            val totalSize = targetFile.length() + simulatedImageBytes
-
-            val completedTask = initialTask.copy(
-                id = taskId,
-                status = "COMPLETED",
-                progress = 100,
-                bytesDownloaded = totalSize,
-                totalBytes = totalSize,
-                localPath = targetFile.absolutePath,
-                errorMessage = null
-            )
-            dao.updateDownloadTask(completedTask)
-
-            val savedWork = SavedWorkEntity(
-                title = taskTitle,
-                sourceUrl = taskUrl,
-                localFilePath = targetFile.absolutePath,
-                fileSizeBytes = totalSize,
-                fileType = "DOWNLOAD"
-            )
-            dao.insertSavedWork(savedWork)
-            Result.success(completedTask)
-        } catch (e: Exception) {
-            val failedTask = initialTask.copy(
-                id = taskId,
-                status = "FAILED",
-                progress = 0,
-                errorMessage = e.localizedMessage ?: "تعذر حفظ الفصل محلياً"
-            )
-            dao.updateDownloadTask(failedTask)
-            Result.failure(e)
-        }
+    ): Result<DownloadedChapterEntity> = runCatching {
+        mangaDownloadManager.downloadChapterSuspend(work, chapter)
     }
 
-    suspend fun togglePauseDownloadTask(task: DownloadTaskEntity) = withContext(Dispatchers.IO) {
-        val nextStatus = when (task.status) {
-            "DOWNLOADING", "PENDING" -> "PAUSED"
-            "PAUSED" -> "COMPLETED"
-            else -> task.status
-        }
-        val nextProgress = if (nextStatus == "COMPLETED") 100 else task.progress.coerceAtLeast(40)
-        dao.updateDownloadTask(
-            task.copy(
-                status = nextStatus,
-                progress = nextProgress
-            )
-        )
-    }
+    suspend fun togglePauseDownloadTask(task: DownloadTaskEntity) =
+        mangaDownloadManager.togglePauseTask(task)
+
+    suspend fun cancelDownloadTask(task: DownloadTaskEntity) =
+        mangaDownloadManager.cancelTask(task)
+
+    suspend fun cancelAllActiveDownloads() =
+        mangaDownloadManager.cancelAllActiveTasks()
+
+    suspend fun clearDownloadHistoryRecords() =
+        mangaDownloadManager.clearFinishedDownloadRecords()
 
     suspend fun retryFailedDownloadTask(task: DownloadTaskEntity) = withContext(Dispatchers.IO) {
-        val savedDir = getSavedDirectory()
-        val file = if (task.localPath.isNotBlank()) File(task.localPath) else File(savedDir, "retry_${task.id}.json")
-        if (!file.exists()) {
-            file.writeText("{\"title\":\"${task.title}\",\"status\":\"COMPLETED\"}", Charsets.UTF_8)
-        }
-        val bytes = file.length().coerceAtLeast(850_000L)
-        dao.updateDownloadTask(
-            task.copy(
-                status = "COMPLETED",
-                progress = 100,
-                bytesDownloaded = bytes,
-                totalBytes = bytes,
-                localPath = file.absolutePath,
-                errorMessage = null
+        val workId = task.workId.ifBlank { "work_${task.id}" }
+        val existingWork = dao.getDownloadedWorkById(workId)
+        val work = if (existingWork != null) {
+            buildOfflineMangaWorkFromEntity(existingWork)
+        } else {
+            MangaWork(
+                id = workId,
+                title = task.title.substringBefore(" - ").ifBlank { task.title },
+                siteName = task.sourceName.ifBlank { "المصدر" },
+                siteUrl = "",
+                siteIconKey = "globe",
+                coverImageUrl = task.coverUrl,
+                coverUrl = task.coverUrl
             )
+        }
+        val chNum = task.chapterNumber.coerceAtLeast(1)
+        val chapter = MangaChapter(
+            id = task.chapterId.ifBlank { "ch-$chNum" },
+            number = chNum,
+            title = "الفصل $chNum",
+            dateText = "الآن",
+            chapterUrl = task.url,
+            pageCount = task.totalPages.coerceAtLeast(5)
         )
+        dao.deleteDownloadTask(task)
+        mangaDownloadManager.downloadChapterSuspend(work, chapter)
     }
 
     suspend fun importFileFromUri(uri: Uri): Result<SavedWorkEntity> = withContext(Dispatchers.IO) {
@@ -626,16 +608,19 @@ class AppRepository(
         dao.deleteSavedWork(work)
     }
 
-    suspend fun deleteDownloadTask(task: DownloadTaskEntity) = withContext(Dispatchers.IO) {
-        try {
-            if (task.localPath.isNotBlank()) {
-                val f = File(task.localPath)
-                if (f.exists()) f.delete()
-            }
-        } catch (_: Exception) {
-        }
-        dao.deleteDownloadTask(task)
+    suspend fun deleteDownloadedWork(workId: String) =
+        mangaDownloadManager.deleteDownloadedWorkCompletely(workId)
+
+    suspend fun deleteDownloadedChapter(workId: String, chapterNumber: Int) {
+        val chapterKey = "${workId}_ch_${chapterNumber}"
+        val chEntity = dao.getDownloadedChapterByKey(chapterKey)
+            ?: dao.getDownloadedChaptersForWorkOnce(workId).find { it.chapterNumber == chapterNumber }
+            ?: return
+        mangaDownloadManager.deleteDownloadedChapter(chEntity)
     }
+
+    suspend fun deleteDownloadTask(task: DownloadTaskEntity) =
+        mangaDownloadManager.deleteTaskAndFiles(task)
 
     suspend fun exportBackupJson(): String = withContext(Dispatchers.IO) {
         val root = JSONObject()
@@ -648,6 +633,7 @@ class AppRepository(
                     put("domain", s.domain)
                     put("isEnabled", s.isEnabled)
                     put("iconKey", s.iconKey)
+                    put("lastVisitedUrl", s.lastVisitedUrl)
                 }
             )
         }
@@ -691,7 +677,8 @@ class AppRepository(
                             url = obj.optString("url", "https://$domain"),
                             domain = domain,
                             isEnabled = obj.optBoolean("isEnabled", true),
-                            iconKey = obj.optString("iconKey", "globe")
+                            iconKey = obj.optString("iconKey", "globe"),
+                            lastVisitedUrl = obj.optString("lastVisitedUrl", "")
                         )
                     )
                     restoredCount++

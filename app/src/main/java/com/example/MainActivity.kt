@@ -21,6 +21,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.MangaCatalogData
+import com.example.data.MangaChapter
+import com.example.data.MangaWork
 import com.example.ui.components.AddSiteFlowDialog
 import com.example.ui.components.AppNavigationDrawerContent
 import com.example.ui.components.BottomToastAndNoticeOverlay
@@ -33,7 +35,6 @@ import com.example.ui.screens.FavoriteCategoriesSettingsScreen
 import com.example.ui.screens.FavoritesScreen
 import com.example.ui.screens.GeneralSettingsScreen
 import com.example.ui.screens.HistoryScreen
-import com.example.ui.screens.InAppBrowserScreen
 import com.example.ui.screens.ManageSitesScreen
 import com.example.ui.screens.MangaChapterReaderScreen
 import com.example.ui.screens.MangaDetailsScreen
@@ -43,6 +44,7 @@ import com.example.ui.screens.ReadingOptionsSettingsScreen
 import com.example.ui.screens.RecommendationsScreen
 import com.example.ui.screens.SettingsMainScreen
 import com.example.ui.screens.SiteCatalogScreen
+import com.example.ui.screens.SourceWebView
 import com.example.ui.screens.StatisticsSettingsScreen
 import com.example.ui.screens.StorageLibraryScreen
 import com.example.ui.screens.StorageSettingsScreen
@@ -82,7 +84,9 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
     val categories by viewModel.categories.collectAsStateWithLifecycle()
     val history by viewModel.history.collectAsStateWithLifecycle()
     val savedWorks by viewModel.savedWorks.collectAsStateWithLifecycle()
+    val downloadedWorks by viewModel.downloadedWorks.collectAsStateWithLifecycle()
     val downloadTasks by viewModel.downloadTasks.collectAsStateWithLifecycle()
+    val isDownloadsPaused by viewModel.isDownloadsPaused.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val storageStats by viewModel.storageStats.collectAsStateWithLifecycle()
     val addSiteDialogState by viewModel.addSiteDialogState.collectAsStateWithLifecycle()
@@ -157,6 +161,7 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                 AppScreen.STORAGE -> {
                     StorageLibraryScreen(
                         savedWorks = savedWorks,
+                        downloadedWorks = downloadedWorks,
                         showContinueReadingButton = settings.showContinueReadingButton,
                         onOpenDrawer = { scope.launch { drawerState.open() } },
                         onImportUri = { uri -> viewModel.importFileToStorage(uri) },
@@ -169,6 +174,9 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         },
                         onSelectMangaWork = { mangaWork ->
                             viewModel.openMangaDetails(mangaWork)
+                        },
+                        onOpenDownloadedWork = { entity ->
+                            viewModel.openDownloadedWorkFromStorage(entity)
                         },
                         onDeleteWork = { work -> viewModel.deleteSavedWork(work) },
                         onContinueReadingClick = {
@@ -195,7 +203,16 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         onOpenSiteInWebView = { site ->
                             viewModel.openBrowserWithUrl(site.url, site.name)
                         },
-                        onShowToast = { msg -> viewModel.showToast(msg) }
+                        onShowToast = { msg -> viewModel.showToast(msg) },
+                        onSaveWholeMangaToStorage = { work ->
+                            viewModel.saveWholeMangaFromCatalog(work)
+                        },
+                        onOpenDownloadsScreen = {
+                            viewModel.navigateTo(AppScreen.DOWNLOADS)
+                        },
+                        onOpenSettingsScreen = {
+                            viewModel.navigateTo(AppScreen.SETTINGS_MAIN)
+                        }
                     )
                 }
 
@@ -206,12 +223,14 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                     }
                     val downloadedChaptersForWork = downloadedChaptersMap[selectedWork.id] ?: emptySet()
                     val readChaptersForWork = readChaptersMap[selectedWork.id] ?: emptySet()
+                    val resumeLabel = viewModel.getFormattedResumeLabel(selectedWork.id)
 
                     MangaDetailsScreen(
                         work = selectedWork,
                         isFavorite = isWorkFav,
                         downloadedChapterNumbers = downloadedChaptersForWork,
                         readChapterNumbers = readChaptersForWork,
+                        resumeLabel = resumeLabel,
                         addedSites = enabledSites,
                         onBackClick = { viewModel.navigateBack() },
                         onOpenChapter = { work, chapter ->
@@ -230,6 +249,12 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         onDownloadChapters = { work, chaptersToDownload, toastMsg ->
                             viewModel.downloadChaptersForWork(work, chaptersToDownload, toastMsg)
                         },
+                        onDeleteSingleDownloadedChapter = { work, chapter ->
+                            viewModel.deleteSingleDownloadedChapter(work, chapter)
+                        },
+                        onRemoveWorkFromStorage = { workId ->
+                            viewModel.deleteDownloadedWorkFromStorage(workId)
+                        },
                         onOpenInWebView = { url, title ->
                             viewModel.openBrowserWithUrl(url, title)
                         },
@@ -247,7 +272,9 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                     }
                     val savedPageIndex = readingProgressMap[selectedWork.id]
                         ?.takeIf { it.first == selectedChapter.number }
-                        ?.second ?: 0
+                        ?.second
+                        ?: selectedChapter.lastReadPage.takeIf { it >= 0 }
+                        ?: 0
 
                     MangaChapterReaderScreen(
                         work = selectedWork,
@@ -273,7 +300,7 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                             viewModel.downloadChaptersForWork(
                                 work = work,
                                 chapters = listOf(chapter),
-                                toastMsg = "تم حفظ ${chapter.title} في التخزين"
+                                toastMsg = "بدأ التنزيل 😭"
                             )
                         },
                         onUpdateWebtoonMode = { enabled ->
@@ -306,12 +333,14 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         },
                         onEditSite = { site -> viewModel.openEditSiteDialog(site) },
                         onDeleteSite = { site -> viewModel.requestDeleteSite(site) },
-                        onMoveSite = { site, up -> viewModel.moveSiteOrder(site, up) }
+                        onMoveSite = { site, up -> viewModel.moveSiteOrder(site, up) },
+                        onTestConnection = { site -> viewModel.testSiteConnection(site) },
+                        onOpenLastVisitedPage = { site -> viewModel.openSiteLastVisitedPage(site) }
                     )
                 }
 
                 AppScreen.BROWSER -> {
-                    InAppBrowserScreen(
+                    SourceWebView(
                         initialUrl = browserUrl,
                         currentTitle = browserTitle,
                         coachmarkAlreadyShown = settings.browserCoachmarkShown,
@@ -332,6 +361,24 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         },
                         onSavePageToStorage = { title, url ->
                             viewModel.saveCurrentPageToStorage(title, url)
+                        },
+                        onOpenCurrentUrlInReader = { title, url ->
+                            val adHocWork = MangaWork(
+                                id = "web_${url.hashCode()}",
+                                title = title.ifBlank { "فصل من المتصفح" },
+                                siteName = selectedSite.name.ifBlank { "المتصفح" },
+                                siteUrl = selectedSite.url.ifBlank { url },
+                                siteIconKey = selectedSite.iconKey,
+                                mangaUrl = url
+                            )
+                            val adHocChapter = MangaChapter(
+                                id = "web_ch_${url.hashCode()}",
+                                number = 1,
+                                title = title.ifBlank { "الفصل 1" },
+                                dateText = "الآن",
+                                chapterUrl = url
+                            )
+                            viewModel.openMangaChapterReader(adHocWork, adHocChapter)
                         },
                         onShowToast = { msg -> viewModel.showToast(msg) },
                         onRecordSearch = { viewModel.recordSearchQuery() },
@@ -386,9 +433,17 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                 AppScreen.DOWNLOADS -> {
                     DownloadsScreen(
                         tasks = downloadTasks,
+                        isAllPaused = isDownloadsPaused,
                         onBackClick = { viewModel.navigateBack() },
                         onStartNewDownload = { title, url -> viewModel.startRealDownload(title, url) },
-                        onDeleteTask = { task -> viewModel.deleteDownloadTask(task) }
+                        onDeleteTask = { task -> viewModel.deleteDownloadTask(task) },
+                        onTogglePauseTask = { task -> viewModel.togglePauseDownloadTask(task) },
+                        onCancelTask = { task -> viewModel.cancelDownloadTask(task) },
+                        onRetryTask = { task -> viewModel.retryDownloadTask(task) },
+                        onOpenDownloadedTask = { task -> viewModel.openDownloadedTaskInReader(task) },
+                        onTogglePauseAll = { viewModel.togglePauseAllDownloads() },
+                        onCancelAll = { viewModel.cancelAllDownloads() },
+                        onClearHistory = { viewModel.clearDownloadHistory() }
                     )
                 }
 
@@ -488,7 +543,7 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                 }
             }
 
-            // Global Add Site 2-Step Dialog (00:33-00:43, 00:54-01:03)
+            // Global Add Site 2-Step Dialog
             AddSiteFlowDialog(
                 state = addSiteDialogState,
                 onUrlChange = { viewModel.updateAddSiteUrlInput(it) },
@@ -520,7 +575,7 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                 onDismiss = { viewModel.setShowLoginDialog(false) }
             )
 
-            // Global Bottom Pill Toast ("تم الإضافة بنجاح") and Restart Notice Banner (00:44, 00:47, 01:04)
+            // Global Bottom Pill Toast and Restart Notice Banner
             BottomToastAndNoticeOverlay(
                 toastMessage = toastMessage,
                 showRestartBanner = showRestartBanner && currentScreen != AppScreen.BROWSER,

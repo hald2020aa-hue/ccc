@@ -3,6 +3,7 @@ package com.example.ui.screens
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -12,6 +13,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -29,6 +31,8 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ViewList
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Book
 import androidx.compose.material.icons.filled.Close
@@ -38,15 +42,17 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.History
-import androidx.compose.material.icons.filled.Lightbulb
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.OpenInBrowser
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Storage
-import androidx.compose.material.icons.filled.StarBorder
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -83,9 +89,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.data.MangaCatalogData
 import com.example.data.MangaWork
 import com.example.data.local.DownloadTaskEntity
+import com.example.data.local.DownloadedWorkEntity
 import com.example.data.local.FavoriteCategoryEntity
 import com.example.data.local.FavoriteEntity
 import com.example.data.local.HistoryEntity
@@ -95,12 +101,12 @@ import com.example.ui.components.MangaCoverArtwork
 import com.example.ui.components.SiteIconBadge
 import com.example.ui.theme.AppCardSurface
 import com.example.ui.theme.AppDialogSurface
-import com.example.ui.theme.AppDividerColor
 import com.example.ui.theme.PeriwinkleOnPrimary
 import com.example.ui.theme.PeriwinklePrimary
 import com.example.ui.theme.TextPrimaryWhite
 import com.example.ui.theme.TextSecondaryGrey
 import com.example.ui.viewmodel.MainViewModel
+import java.text.DecimalFormat
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -108,11 +114,13 @@ import java.util.Locale
 @Composable
 fun StorageLibraryScreen(
     savedWorks: List<SavedWorkEntity>,
+    downloadedWorks: List<DownloadedWorkEntity> = emptyList(),
     showContinueReadingButton: Boolean,
     onOpenDrawer: () -> Unit,
     onImportUri: (Uri) -> Unit,
     onOpenWork: (SavedWorkEntity) -> Unit,
     onSelectMangaWork: (MangaWork) -> Unit,
+    onOpenDownloadedWork: (DownloadedWorkEntity) -> Unit = {},
     onDeleteWork: (SavedWorkEntity) -> Unit,
     onContinueReadingClick: () -> Unit,
     onOpenDownloadsScreen: () -> Unit,
@@ -123,6 +131,9 @@ fun StorageLibraryScreen(
     var sortMode by remember { mutableStateOf("آخر الاضافات") }
     var showSortMenu by remember { mutableStateOf(false) }
     var showMoreMenu by remember { mutableStateOf(false) }
+    var showViewModeSubMenu by remember { mutableStateOf(false) }
+    var viewMode by remember { mutableStateOf("متوسط") } // القائمة | صغير | متوسط | كبير
+    var showBookmarksDialog by remember { mutableStateOf(false) }
 
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -132,31 +143,57 @@ fun StorageLibraryScreen(
         }
     }
 
-    val libraryMangaWorks = remember(savedWorks, searchQuery, sortMode) {
-        val baseWorks = savedWorks.map { saved ->
+    val combinedWorks = remember(downloadedWorks, savedWorks, searchQuery, sortMode) {
+        val offlineItems = downloadedWorks.map { entity ->
             MangaWork(
-                id = "saved_${saved.id}",
-                title = saved.title,
-                arabicBannerTitle = "",
-                siteName = "التخزين",
-                siteUrl = saved.sourceUrl.substringBefore("/series").ifBlank { saved.sourceUrl },
-                siteIconKey = "globe",
-                mangaUrl = saved.sourceUrl,
-                coverImageUrl = "",
-                chaptersCount = 0
-            )
+                id = entity.workId,
+                title = entity.title,
+                subtitle = entity.subtitle,
+                siteName = entity.sourceName.ifBlank { "التخزين" },
+                siteUrl = entity.sourceUrl,
+                siteIconKey = entity.siteIconKey,
+                mangaUrl = entity.mangaUrl,
+                coverUrl = entity.coverUrl,
+                rating = entity.rating,
+                status = entity.status,
+                type = entity.type,
+                author = entity.author,
+                genres = entity.genresCsv.split(",").map { it.trim() }.filter { it.isNotEmpty() },
+                synopsis = entity.synopsis,
+                localCoverPath = entity.localCoverPath,
+                isFromLocalStorage = true,
+                storageSizeBytes = entity.totalStorageBytes
+            ) to entity
         }
+        val importedItems = savedWorks
+            .filter { it.fileType == "IMPORT" || it.fileType == "PAGE" }
+            .map { saved ->
+                MangaWork(
+                    id = "saved_${saved.id}",
+                    title = saved.title,
+                    subtitle = "",
+                    siteName = "التخزين",
+                    siteUrl = saved.sourceUrl.substringBefore("/series").ifBlank { saved.sourceUrl },
+                    siteIconKey = "globe",
+                    mangaUrl = saved.sourceUrl,
+                    coverUrl = "",
+                    isFromLocalStorage = true,
+                    storageSizeBytes = saved.fileSizeBytes
+                ) to (null as DownloadedWorkEntity?)
+            }
+
+        val all = offlineItems + importedItems
         val matching = if (searchQuery.isBlank()) {
-            baseWorks
+            all
         } else {
-            baseWorks.filter {
-                it.title.contains(searchQuery, ignoreCase = true) ||
-                    it.siteName.contains(searchQuery, ignoreCase = true)
+            all.filter { (work, _) ->
+                work.title.contains(searchQuery, ignoreCase = true) ||
+                    work.siteName.contains(searchQuery, ignoreCase = true)
             }
         }
         when (sortMode) {
-            "الاسم" -> matching.sortedBy { it.title }
-            "الحجم" -> matching.sortedByDescending { it.chaptersCount }
+            "الاسم", "أبجدي" -> matching.sortedBy { it.first.title }
+            "الحجم" -> matching.sortedByDescending { it.first.storageSizeBytes }
             else -> matching
         }
     }
@@ -169,7 +206,7 @@ fun StorageLibraryScreen(
             .testTag("storage_screen")
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
-            // Top Bar (00:01): Menu ☰ on Right, Search 🔍 + More ⋮ on Left
+            // Top Bar (00:01 & 07:13): Menu ☰ on Right, Search 🔍 + More ⋮ on Left
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -226,7 +263,10 @@ fun StorageLibraryScreen(
 
                         Box {
                             IconButton(
-                                onClick = { showMoreMenu = true },
+                                onClick = {
+                                    showViewModeSubMenu = false
+                                    showMoreMenu = true
+                                },
                                 modifier = Modifier.testTag("storage_more_button")
                             ) {
                                 Icon(
@@ -235,42 +275,75 @@ fun StorageLibraryScreen(
                                     tint = TextPrimaryWhite
                                 )
                             }
+                            // Exact 5-item menu from 07:13-07:15: نمط العرض، المراجع، استيراد، التنزيلات، الاعدادات
                             DropdownMenu(
                                 expanded = showMoreMenu,
                                 onDismissRequest = { showMoreMenu = false },
                                 containerColor = AppDialogSurface
                             ) {
-                                DropdownMenuItem(
-                                    text = { Text("استيراد ملف من الجهاز", color = TextPrimaryWhite) },
-                                    leadingIcon = { Icon(Icons.Default.FolderOpen, null, tint = PeriwinklePrimary) },
-                                    onClick = {
-                                        showMoreMenu = false
-                                        filePickerLauncher.launch(arrayOf("*/*"))
+                                if (!showViewModeSubMenu) {
+                                    DropdownMenuItem(
+                                        text = { Text("نمط العرض", color = TextPrimaryWhite) },
+                                        leadingIcon = { Icon(Icons.Default.GridView, null, tint = PeriwinklePrimary) },
+                                        onClick = { showViewModeSubMenu = true }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("المراجع", color = TextPrimaryWhite) },
+                                        leadingIcon = { Icon(Icons.Default.Book, null, tint = PeriwinklePrimary) },
+                                        onClick = {
+                                            showMoreMenu = false
+                                            showBookmarksDialog = true
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("استيراد", color = TextPrimaryWhite) },
+                                        leadingIcon = { Icon(Icons.Default.FolderOpen, null, tint = PeriwinklePrimary) },
+                                        onClick = {
+                                            showMoreMenu = false
+                                            filePickerLauncher.launch(arrayOf("*/*"))
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("التنزيلات", color = TextPrimaryWhite) },
+                                        leadingIcon = { Icon(Icons.Default.Download, null, tint = PeriwinklePrimary) },
+                                        onClick = {
+                                            showMoreMenu = false
+                                            onOpenDownloadsScreen()
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("الاعدادات", color = TextPrimaryWhite) },
+                                        leadingIcon = { Icon(Icons.Default.Settings, null, tint = PeriwinklePrimary) },
+                                        onClick = {
+                                            showMoreMenu = false
+                                            onOpenStorageSettings()
+                                        }
+                                    )
+                                } else {
+                                    listOf("القائمة", "صغير", "متوسط", "كبير").forEach { mode ->
+                                        DropdownMenuItem(
+                                            text = {
+                                                Text(
+                                                    text = if (viewMode == mode) "✓ $mode" else mode,
+                                                    color = if (viewMode == mode) PeriwinklePrimary else TextPrimaryWhite,
+                                                    fontWeight = if (viewMode == mode) FontWeight.Bold else FontWeight.Normal
+                                                )
+                                            },
+                                            onClick = {
+                                                viewMode = mode
+                                                showViewModeSubMenu = false
+                                                showMoreMenu = false
+                                            }
+                                        )
                                     }
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("إدارة التنزيلات", color = TextPrimaryWhite) },
-                                    leadingIcon = { Icon(Icons.Default.Download, null, tint = PeriwinklePrimary) },
-                                    onClick = {
-                                        showMoreMenu = false
-                                        onOpenDownloadsScreen()
-                                    }
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("إحصائيات وإعدادات التخزين", color = TextPrimaryWhite) },
-                                    leadingIcon = { Icon(Icons.Default.Storage, null, tint = PeriwinklePrimary) },
-                                    onClick = {
-                                        showMoreMenu = false
-                                        onOpenStorageSettings()
-                                    }
-                                )
+                                }
                             }
                         }
                     }
                 }
             }
 
-            // Title Row: "التخزين" on the right, "آخر الاضافات" filter on the left (00:01)
+            // Title Row: "التخزين" on the right, "آخر الاضافات" filter on the left (00:01 & 03:09)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -314,7 +387,7 @@ fun StorageLibraryScreen(
                         onDismissRequest = { showSortMenu = false },
                         containerColor = AppDialogSurface
                     ) {
-                        listOf("آخر الاضافات", "الاسم", "الحجم").forEach { mode ->
+                        listOf("آخر الاضافات", "أبجدي", "الحجم").forEach { mode ->
                             DropdownMenuItem(
                                 text = { Text(mode, color = TextPrimaryWhite) },
                                 onClick = {
@@ -327,7 +400,8 @@ fun StorageLibraryScreen(
                 }
             }
 
-            if (libraryMangaWorks.isEmpty()) {
+            // Empty State matching 00:06: (-_-) + لم تحفظ اي عمل في التخزين. + استيراد pill button
+            if (combinedWorks.isEmpty()) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -335,32 +409,133 @@ fun StorageLibraryScreen(
                     contentAlignment = Alignment.Center
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(
-                            imageVector = Icons.Default.Book,
-                            contentDescription = null,
-                            tint = Color(0xFF4C505E),
-                            modifier = Modifier.size(84.dp)
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
                         Text(
-                            text = "لا توجد أعمال محفوظة في التخزين حالياً",
+                            text = "(-_-)",
                             color = TextPrimaryWhite,
-                            fontSize = 17.sp,
+                            fontSize = 36.sp,
                             fontWeight = FontWeight.Bold,
                             textAlign = TextAlign.Center
                         )
-                        Spacer(modifier = Modifier.height(8.dp))
+                        Spacer(modifier = Modifier.height(14.dp))
                         Text(
-                            text = "قم بإضافة مواقع المانجا من قسم «إدارة المواقع» في القائمة الجانبية لتصفح الأعمال وتنزيل الفصول مباشرة من الموقع.",
-                            color = TextSecondaryGrey,
-                            fontSize = 13.sp,
+                            text = "لم تحفظ اي عمل في التخزين.",
+                            color = Color(0xFFD5DAE6),
+                            fontSize = 15.sp,
                             textAlign = TextAlign.Center
                         )
+                        Spacer(modifier = Modifier.height(20.dp))
+                        OutlinedButton(
+                            onClick = { filePickerLauncher.launch(arrayOf("*/*")) },
+                            shape = RoundedCornerShape(24.dp),
+                            border = BorderStroke(1.dp, Color(0xFF4C5264)),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = PeriwinklePrimary),
+                            modifier = Modifier.testTag("storage_empty_import_button")
+                        ) {
+                            Text(
+                                text = "استيراد",
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                }
+            } else if (viewMode == "القائمة") {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .testTag("storage_manga_list"),
+                    contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 6.dp, bottom = 96.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    items(combinedWorks, key = { it.first.id }) { (mangaWork, downloadedEntity) ->
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = AppCardSurface),
+                            shape = RoundedCornerShape(14.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    if (downloadedEntity != null) {
+                                        onOpenDownloadedWork(downloadedEntity)
+                                    } else {
+                                        onSelectMangaWork(mangaWork)
+                                    }
+                                }
+                                .testTag("storage_manga_card_${mangaWork.id}")
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                MangaCoverArtwork(
+                                    work = mangaWork,
+                                    modifier = Modifier
+                                        .width(82.dp)
+                                        .height(114.dp)
+                                )
+                                Spacer(modifier = Modifier.width(14.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = mangaWork.title,
+                                        color = TextPrimaryWhite,
+                                        fontSize = 16.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    if (mangaWork.genres.isNotEmpty()) {
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            text = mangaWork.genres.joinToString(" ، "),
+                                            color = TextSecondaryGrey,
+                                            fontSize = 12.sp,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Row {
+                                            repeat(5) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Star,
+                                                    contentDescription = null,
+                                                    tint = Color(0xFF60667A),
+                                                    modifier = Modifier.size(15.dp)
+                                                )
+                                            }
+                                        }
+                                        TextButton(
+                                            onClick = {
+                                                if (downloadedEntity != null) {
+                                                    onOpenDownloadedWork(downloadedEntity)
+                                                } else {
+                                                    onSelectMangaWork(mangaWork)
+                                                }
+                                            }
+                                        ) {
+                                            Text("إقرأ", color = PeriwinklePrimary, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             } else {
+                val minCellSize = when (viewMode) {
+                    "صغير" -> 66.dp
+                    "كبير" -> 150.dp
+                    else -> 104.dp
+                }
                 LazyVerticalGrid(
-                    columns = GridCells.Adaptive(minSize = 104.dp),
+                    columns = GridCells.Adaptive(minSize = minCellSize),
                     modifier = Modifier
                         .fillMaxSize()
                         .testTag("storage_manga_grid"),
@@ -373,12 +548,18 @@ fun StorageLibraryScreen(
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                     verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
-                    items(libraryMangaWorks, key = { it.id }) { mangaWork ->
+                    items(combinedWorks, key = { it.first.id }) { (mangaWork, downloadedEntity) ->
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(10.dp))
-                                .clickable { onSelectMangaWork(mangaWork) }
+                                .clickable {
+                                    if (downloadedEntity != null) {
+                                        onOpenDownloadedWork(downloadedEntity)
+                                    } else {
+                                        onSelectMangaWork(mangaWork)
+                                    }
+                                }
                                 .testTag("storage_manga_card_${mangaWork.id}"),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
@@ -386,7 +567,7 @@ fun StorageLibraryScreen(
                                 work = mangaWork,
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .height(152.dp),
+                                    .aspectRatio(0.71f),
                                 showArabicTitleBanner = false
                             )
                             Spacer(modifier = Modifier.height(6.dp))
@@ -408,7 +589,7 @@ fun StorageLibraryScreen(
             }
         }
 
-        // Exact Bottom-Left "متابعة" Floating Button from 01:39-01:40 & 00:00
+        // Exact Bottom-Left "متابعة" Floating Button from 00:00, 01:39, 03:09
         if (showContinueReadingButton) {
             Surface(
                 shape = RoundedCornerShape(16.dp),
@@ -449,18 +630,55 @@ fun StorageLibraryScreen(
             }
         }
     }
+
+    if (showBookmarksDialog) {
+        AlertDialog(
+            onDismissRequest = { showBookmarksDialog = false },
+            containerColor = AppDialogSurface,
+            title = { Text("المراجع", color = TextPrimaryWhite, fontWeight = FontWeight.Bold) },
+            text = {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 24.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("السجل فارغ.", color = TextSecondaryGrey, fontSize = 14.sp)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showBookmarksDialog = false }) {
+                    Text("إغلاق", color = PeriwinklePrimary)
+                }
+            }
+        )
+    }
 }
 
 @Composable
 fun DownloadsScreen(
     tasks: List<DownloadTaskEntity>,
+    isAllPaused: Boolean = false,
     onBackClick: () -> Unit,
     onStartNewDownload: (String, String) -> Unit,
-    onDeleteTask: (DownloadTaskEntity) -> Unit
+    onDeleteTask: (DownloadTaskEntity) -> Unit,
+    onTogglePauseTask: (DownloadTaskEntity) -> Unit = {},
+    onCancelTask: (DownloadTaskEntity) -> Unit = {},
+    onRetryTask: (DownloadTaskEntity) -> Unit = {},
+    onOpenDownloadedTask: (DownloadTaskEntity) -> Unit = {},
+    onTogglePauseAll: () -> Unit = {},
+    onCancelAll: () -> Unit = {},
+    onClearHistory: () -> Unit = {}
 ) {
-    var showAddDownloadDialog by remember { mutableStateOf(false) }
-    var downloadTitle by remember { mutableStateOf("") }
-    var downloadUrl by remember { mutableStateOf("") }
+    var showMoreMenu by remember { mutableStateOf(false) }
+    val dfPercent = remember { DecimalFormat("0.0") }
+
+    val activeTasks = remember(tasks) {
+        tasks.filter { it.status == "DOWNLOADING" || it.status == "QUEUED" || it.status == "PAUSED" }
+    }
+    val finishedTasks = remember(tasks) {
+        tasks.filter { it.status != "DOWNLOADING" && it.status != "QUEUED" && it.status != "PAUSED" }
+    }
 
     Column(
         modifier = Modifier
@@ -469,143 +687,370 @@ fun DownloadsScreen(
             .windowInsetsPadding(WindowInsets.navigationBars)
             .testTag("downloads_screen")
     ) {
+        // Exact Top Bar from 02:40 - 03:08 & 07:16 - 08:01:
+        // Right: Back arrow + "التنزيلات"
+        // Left: "إيقاف ⏸" button + "⋮" menu ("إلغاء الكل", "حذف السجل")
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(60.dp)
-                .padding(horizontal = 12.dp),
+                .padding(horizontal = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = onBackClick) {
-                    Icon(Icons.Default.Menu, contentDescription = "القائمة", tint = TextPrimaryWhite)
+                IconButton(
+                    onClick = onBackClick,
+                    modifier = Modifier.testTag("downloads_back_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = "رجوع",
+                        tint = TextPrimaryWhite
+                    )
                 }
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("التنزيلات", color = TextPrimaryWhite, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "التنزيلات",
+                    color = TextPrimaryWhite,
+                    fontSize = 21.sp,
+                    fontWeight = FontWeight.Bold
+                )
             }
-            Button(
-                onClick = { showAddDownloadDialog = true },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = PeriwinklePrimary,
-                    contentColor = PeriwinkleOnPrimary
-                ),
-                shape = RoundedCornerShape(20.dp)
-            ) {
-                Icon(Icons.Default.Add, null, modifier = Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(4.dp))
-                Text("تنزيل رابط", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TextButton(
+                    onClick = onTogglePauseAll,
+                    modifier = Modifier.testTag("downloads_pause_all_button")
+                ) {
+                    Text(
+                        text = if (isAllPaused) "استئناف" else "إيقاف",
+                        color = TextPrimaryWhite,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Icon(
+                        imageVector = if (isAllPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                        contentDescription = null,
+                        tint = TextPrimaryWhite,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+
+                Box {
+                    IconButton(
+                        onClick = { showMoreMenu = true },
+                        modifier = Modifier.testTag("downloads_more_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.MoreVert,
+                            contentDescription = "خيارات التنزيلات",
+                            tint = TextPrimaryWhite
+                        )
+                    }
+                    // Exact menu from 03:00: إلغاء الكل، حذف السجل
+                    DropdownMenu(
+                        expanded = showMoreMenu,
+                        onDismissRequest = { showMoreMenu = false },
+                        containerColor = AppDialogSurface
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("إلغاء الكل", color = TextPrimaryWhite) },
+                            onClick = {
+                                showMoreMenu = false
+                                onCancelAll()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("حذف السجل", color = TextPrimaryWhite) },
+                            onClick = {
+                                showMoreMenu = false
+                                onClearHistory()
+                            }
+                        )
+                    }
+                }
             }
         }
 
         if (tasks.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
-                        imageVector = Icons.Default.Download,
-                        contentDescription = null,
-                        tint = Color(0xFF4D5260),
-                        modifier = Modifier.size(84.dp)
+                    Text(
+                        text = "(-_-)",
+                        color = TextPrimaryWhite,
+                        fontSize = 34.sp,
+                        fontWeight = FontWeight.Bold
                     )
-                    Spacer(modifier = Modifier.height(14.dp))
-                    Text("لا توجد عمليات تنزيل حاليًا", color = TextPrimaryWhite, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text("يمكنك حفظ الصفحات من المتصفح أو بدء تنزيل مباشر بالرابط.", color = TextSecondaryGrey, fontSize = 13.sp)
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(
+                        text = "لا توجد عمليات تنزيل حاليًا",
+                        color = TextSecondaryGrey,
+                        fontSize = 15.sp
+                    )
                 }
             }
         } else {
             LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                modifier = Modifier
+                    .fillMaxSize()
+                    .testTag("downloads_list"),
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                items(tasks, key = { it.id }) { task ->
-                    Card(
-                        colors = CardDefaults.cardColors(containerColor = AppCardSurface),
-                        shape = RoundedCornerShape(14.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(modifier = Modifier.padding(16.dp)) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = task.title,
-                                    color = TextPrimaryWhite,
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 15.sp,
-                                    modifier = Modifier.weight(1f)
-                                )
-                                IconButton(onClick = { onDeleteTask(task) }) {
-                                    Icon(Icons.Default.Delete, contentDescription = "حذف", tint = Color(0xFFFF6B6B))
-                                }
-                            }
-                            val statusText = when (task.status) {
-                                "DOWNLOADING" -> "جار التنزيل... (${task.progress}%)"
-                                "COMPLETED" -> "مكتمل • ${MainViewModel.formatBytesArabic(task.bytesDownloaded)}"
-                                "FAILED" -> "فشل التنزيل: ${task.errorMessage ?: ""}"
-                                else -> task.status
-                            }
-                            Text(text = statusText, color = TextSecondaryGrey, fontSize = 13.sp)
-                            if (task.status == "DOWNLOADING") {
-                                Spacer(modifier = Modifier.height(8.dp))
-                                LinearProgressIndicator(
-                                    progress = { task.progress / 100f },
-                                    color = PeriwinklePrimary,
-                                    modifier = Modifier.fillMaxWidth()
-                                )
-                            }
-                        }
+                if (activeTasks.isNotEmpty()) {
+                    item {
+                        Text(
+                            text = "قيد التنفيذ",
+                            color = PeriwinklePrimary,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
+                        )
+                    }
+                    items(activeTasks, key = { it.id }) { task ->
+                        DownloadTaskCard(
+                            task = task,
+                            dfPercent = dfPercent,
+                            onTogglePause = { onTogglePauseTask(task) },
+                            onCancel = { onCancelTask(task) },
+                            onRetry = { onRetryTask(task) },
+                            onOpen = { onOpenDownloadedTask(task) },
+                            onDelete = { onDeleteTask(task) }
+                        )
+                    }
+                }
+
+                if (finishedTasks.isNotEmpty()) {
+                    item {
+                        Text(
+                            text = "الآن",
+                            color = PeriwinklePrimary,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
+                        )
+                    }
+                    items(finishedTasks, key = { it.id }) { task ->
+                        DownloadTaskCard(
+                            task = task,
+                            dfPercent = dfPercent,
+                            onTogglePause = { onTogglePauseTask(task) },
+                            onCancel = { onCancelTask(task) },
+                            onRetry = { onRetryTask(task) },
+                            onOpen = { onOpenDownloadedTask(task) },
+                            onDelete = { onDeleteTask(task) }
+                        )
                     }
                 }
             }
         }
     }
+}
 
-    if (showAddDownloadDialog) {
-        AlertDialog(
-            onDismissRequest = { showAddDownloadDialog = false },
-            containerColor = AppDialogSurface,
-            title = { Text("تنزيل صفحة أو ملف", color = TextPrimaryWhite, fontWeight = FontWeight.Bold) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedTextField(
-                        value = downloadTitle,
-                        onValueChange = { downloadTitle = it },
-                        label = { Text("اسم العمل أو الملف") },
-                        singleLine = true
+@Composable
+private fun DownloadTaskCard(
+    task: DownloadTaskEntity,
+    dfPercent: DecimalFormat,
+    onTogglePause: () -> Unit,
+    onCancel: () -> Unit,
+    onRetry: () -> Unit,
+    onOpen: () -> Unit,
+    onDelete: () -> Unit
+) {
+    val isActive = task.status == "DOWNLOADING" || task.status == "QUEUED" || task.status == "PAUSED"
+    val workForThumb = remember(task.workId, task.title, task.coverUrl) {
+        MangaWork(
+            id = task.workId.ifBlank { "task_${task.id}" },
+            title = task.title,
+            siteName = task.sourceName,
+            siteUrl = "",
+            siteIconKey = "globe",
+            coverUrl = task.coverUrl
+        )
+    }
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = AppCardSurface),
+        shape = RoundedCornerShape(14.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = task.status == "COMPLETED") { onOpen() }
+            .testTag("download_task_card_${task.id}")
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalAlignment = Alignment.Top
+        ) {
+            MangaCoverArtwork(
+                work = workForThumb,
+                modifier = Modifier
+                    .width(68.dp)
+                    .height(94.dp)
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = task.title.substringBefore(" - ").ifBlank { task.title },
+                    color = TextPrimaryWhite,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+
+                if (isActive) {
+                    val etaOrStatus = when {
+                        task.status == "PAUSED" -> "متوقف مؤقتاً"
+                        task.etaSeconds > 0 -> "جار التنزيل...  خلال ${task.etaSeconds} ثانية"
+                        else -> "جار التنزيل...  عالقة"
+                    }
+                    Text(
+                        text = etaOrStatus,
+                        color = TextSecondaryGrey,
+                        fontSize = 12.sp
                     )
-                    OutlinedTextField(
-                        value = downloadUrl,
-                        onValueChange = { downloadUrl = it },
-                        label = { Text("الرابط المباشر (https://...)") },
-                        singleLine = true
+                    Spacer(modifier = Modifier.height(6.dp))
+                    val exactPercent = if (task.totalPages > 0) {
+                        (task.downloadedPages.toDouble() * 100.0 / task.totalPages.toDouble()).coerceIn(0.0, 100.0)
+                    } else {
+                        task.progress.toDouble()
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "${dfPercent.format(exactPercent)}%",
+                            color = TextSecondaryGrey,
+                            fontSize = 12.sp
+                        )
+                        Text(
+                            text = "${task.downloadedPages}/${task.totalPages.coerceAtLeast(1)}",
+                            color = TextSecondaryGrey,
+                            fontSize = 11.sp
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    LinearProgressIndicator(
+                        progress = { (task.progress / 100f).coerceIn(0f, 1f) },
+                        color = PeriwinklePrimary,
+                        trackColor = Color(0xFF2B2F3C),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(5.dp)
+                            .clip(RoundedCornerShape(3.dp))
                     )
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        if (downloadUrl.isNotBlank()) {
-                            onStartNewDownload(downloadTitle.ifBlank { downloadUrl }, downloadUrl.trim())
-                            showAddDownloadDialog = false
-                            downloadTitle = ""
-                            downloadUrl = ""
+                    Spacer(modifier = Modifier.height(10.dp))
+                    // Action buttons matching 02:41: إيقاف + إلغاء
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = onTogglePause,
+                            shape = RoundedCornerShape(20.dp),
+                            border = BorderStroke(1.dp, Color(0xFF4C5264)),
+                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
+                            modifier = Modifier
+                                .height(34.dp)
+                                .testTag("download_pause_btn_${task.id}")
+                        ) {
+                            Text(
+                                text = if (task.status == "PAUSED") "استئناف" else "إيقاف",
+                                color = PeriwinklePrimary,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = PeriwinklePrimary, contentColor = PeriwinkleOnPrimary)
-                ) {
-                    Text("بدء التنزيل", fontWeight = FontWeight.Bold)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showAddDownloadDialog = false }) {
-                    Text("إلغاء", color = PeriwinklePrimary)
+                        OutlinedButton(
+                            onClick = onCancel,
+                            shape = RoundedCornerShape(20.dp),
+                            border = BorderStroke(1.dp, Color(0xFF4C5264)),
+                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
+                            modifier = Modifier
+                                .height(34.dp)
+                                .testTag("download_cancel_btn_${task.id}")
+                        ) {
+                            Text(
+                                text = "إلغاء",
+                                color = PeriwinklePrimary,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                } else {
+                    val statusLine1 = when (task.status) {
+                        "COMPLETED" -> "اكتمل التنزيل"
+                        "CANCELLED" -> "ألغيت"
+                        "INCOMPLETE" -> "غير مكتمل (${task.downloadedPages}/${task.totalPages} صور)"
+                        "FAILED" -> "فشل التنزيل"
+                        else -> task.status
+                    }
+                    val statusColor = when (task.status) {
+                        "COMPLETED" -> TextSecondaryGrey
+                        "INCOMPLETE", "FAILED" -> Color(0xFFFF8A80)
+                        else -> TextSecondaryGrey
+                    }
+                    Text(
+                        text = statusLine1,
+                        color = statusColor,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = if (task.status == "COMPLETED") {
+                            "فصل واحد • ${MainViewModel.formatBytesArabic(task.bytesDownloaded)}"
+                        } else {
+                            task.errorMessage ?: "فصل ${task.chapterNumber}"
+                        },
+                        color = TextSecondaryGrey,
+                        fontSize = 12.sp
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (task.status == "COMPLETED") {
+                            TextButton(
+                                onClick = onOpen,
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                                modifier = Modifier.testTag("download_open_btn_${task.id}")
+                            ) {
+                                Text("قراءة بدون إنترنت", color = PeriwinklePrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                        if (task.status == "FAILED" || task.status == "INCOMPLETE" || task.status == "CANCELLED") {
+                            TextButton(
+                                onClick = onRetry,
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                                modifier = Modifier.testTag("download_retry_btn_${task.id}")
+                            ) {
+                                Text("إعادة المحاولة", color = PeriwinklePrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                        IconButton(
+                            onClick = onDelete,
+                            modifier = Modifier
+                                .size(32.dp)
+                                .testTag("download_delete_btn_${task.id}")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Delete,
+                                contentDescription = "حذف",
+                                tint = TextSecondaryGrey,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
                 }
             }
-        )
+        }
     }
 }
 
@@ -634,47 +1079,41 @@ fun RecommendationsScreen(
                 Icon(Icons.Default.Menu, contentDescription = "القائمة", tint = TextPrimaryWhite)
             }
             Spacer(modifier = Modifier.width(8.dp))
-            Text("التوصيات", color = TextPrimaryWhite, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            Text("التوصيات", color = TextPrimaryWhite, fontSize = 24.sp, fontWeight = FontWeight.Bold)
         }
 
+        // Exact Empty State from 03:55: ( ⊙д⊙) + لا تتوفر تصنيفات كافية لتوصياتك. يمكنك تصفح «الكل». + إعادة المحاولة
         if (enabledSites.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     modifier = Modifier.padding(horizontal = 32.dp)
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Lightbulb,
-                        contentDescription = null,
-                        tint = Color(0xFF4C505E),
-                        modifier = Modifier.size(90.dp)
+                    Text(
+                        text = "( ⊙д⊙)",
+                        color = TextPrimaryWhite,
+                        fontSize = 36.sp,
+                        fontWeight = FontWeight.Bold
                     )
                     Spacer(modifier = Modifier.height(16.dp))
                     Text(
-                        text = "لا توجد توصيات متاحة حاليًا",
-                        color = TextPrimaryWhite,
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "أضف مواقعك المفضلة من شاشة «إدارة المواقع» لتظهر أحدث التوصيات والأعمال هنا.",
-                        color = TextSecondaryGrey,
+                        text = "لا تتوفر تصنيفات كافية لتوصياتك. يمكنك تصفح «الكل».",
+                        color = Color(0xFFD5DAE6),
                         fontSize = 14.sp,
                         textAlign = TextAlign.Center
                     )
                     Spacer(modifier = Modifier.height(22.dp))
-                    Button(
+                    OutlinedButton(
                         onClick = onOpenManageSites,
                         shape = RoundedCornerShape(24.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = PeriwinklePrimary,
-                            contentColor = PeriwinkleOnPrimary
-                        )
+                        border = BorderStroke(1.dp, Color(0xFF4C5264)),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = PeriwinklePrimary)
                     ) {
-                        Icon(Icons.Default.Extension, null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("إدارة المواقع", fontWeight = FontWeight.Bold)
+                        Text(
+                            text = "إعادة المحاولة",
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                        )
                     }
                 }
             }
@@ -766,14 +1205,14 @@ fun UpdatesScreen(
         if (enabledSites.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
-                        imageVector = Icons.Default.Sync,
-                        contentDescription = null,
-                        tint = Color(0xFF4C505E),
-                        modifier = Modifier.size(88.dp)
+                    Text(
+                        text = "(⊙_⊙)",
+                        color = TextPrimaryWhite,
+                        fontSize = 36.sp,
+                        fontWeight = FontWeight.Bold
                     )
                     Spacer(modifier = Modifier.height(16.dp))
-                    Text("لا توجد تحديثات فصول جديدة", color = TextPrimaryWhite, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                    Text("لا توجد تحديثات فصول جديدة", color = TextPrimaryWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                     Spacer(modifier = Modifier.height(6.dp))
                     Text("أضف مواقع الأعمال والمفضلة لمتابعة الفصول الجديدة.", color = TextSecondaryGrey, fontSize = 13.sp)
                 }
@@ -845,6 +1284,12 @@ fun FavoritesScreen(
         else favorites.filter { it.category == selectedCategory }
     }
 
+    val defaultChips = remember(categories, favorites) {
+        val base = listOf("الكل", "قراءة الآن", "قراءة لاحقا")
+        val custom = categories.map { it.name }.filter { it !in base }
+        base + custom
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -865,56 +1310,52 @@ fun FavoritesScreen(
                     Icon(Icons.Default.Menu, contentDescription = "القائمة", tint = TextPrimaryWhite)
                 }
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("المفضلة", color = TextPrimaryWhite, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                Text("المفضلة", color = TextPrimaryWhite, fontSize = 24.sp, fontWeight = FontWeight.Bold)
             }
             TextButton(onClick = onManageCategories) {
                 Text("فئات المفضلة", color = PeriwinklePrimary, fontWeight = FontWeight.SemiBold)
             }
         }
 
-        if (categories.isNotEmpty()) {
-            LazyRow(
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                item {
-                    FilterChip(
-                        selected = selectedCategory == "الكل",
-                        onClick = { selectedCategory = "الكل" },
-                        label = { Text("الكل") },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = PeriwinklePrimary,
-                            selectedLabelColor = PeriwinkleOnPrimary
-                        )
-                    )
+        // Category chips matching 04:00: الكل 0 ، قراءة الآن 0 ، قراءة لاحقا 0
+        LazyRow(
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            items(defaultChips) { chipName ->
+                val count = if (chipName == "الكل") {
+                    favorites.size
+                } else {
+                    favorites.count { it.category == chipName }
                 }
-                items(categories, key = { it.id }) { cat ->
-                    FilterChip(
-                        selected = selectedCategory == cat.name,
-                        onClick = { selectedCategory = cat.name },
-                        label = { Text(cat.name) },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = PeriwinklePrimary,
-                            selectedLabelColor = PeriwinkleOnPrimary
-                        )
+                FilterChip(
+                    selected = selectedCategory == chipName,
+                    onClick = { selectedCategory = chipName },
+                    label = { Text("$chipName  $count") },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = Color(0xFF2E354B),
+                        selectedLabelColor = TextPrimaryWhite
                     )
-                }
+                )
             }
         }
 
+        // Exact Empty State from 04:00: (⊙_⊙) + المفضلة فارغة.
         if (filtered.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
-                        imageVector = Icons.Default.StarBorder,
-                        contentDescription = null,
-                        tint = Color(0xFF4C505E),
-                        modifier = Modifier.size(88.dp)
+                    Text(
+                        text = "(⊙_⊙)",
+                        color = TextPrimaryWhite,
+                        fontSize = 36.sp,
+                        fontWeight = FontWeight.Bold
                     )
                     Spacer(modifier = Modifier.height(14.dp))
-                    Text("قائمة المفضلة فارغة", color = TextPrimaryWhite, fontSize = 17.sp, fontWeight = FontWeight.Bold)
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text("يمكنك إضافة أي عمل أو صفحة إلى المفضلة من قائمة المتصفح.", color = TextSecondaryGrey, fontSize = 13.sp)
+                    Text(
+                        text = "المفضلة فارغة.",
+                        color = Color(0xFFD5DAE6),
+                        fontSize = 15.sp
+                    )
                 }
             }
         } else {
@@ -984,7 +1425,7 @@ fun HistoryScreen(
                     Icon(Icons.Default.Menu, contentDescription = "القائمة", tint = TextPrimaryWhite)
                 }
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("السجل", color = TextPrimaryWhite, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                Text("السجل", color = TextPrimaryWhite, fontSize = 24.sp, fontWeight = FontWeight.Bold)
             }
             if (historyItems.isNotEmpty()) {
                 IconButton(
@@ -996,19 +1437,22 @@ fun HistoryScreen(
             }
         }
 
+        // Exact Empty State from 04:01 & 04:07: (´; ω ; ｀) + السجل فارغ.
         if (historyItems.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
-                        imageVector = Icons.Default.History,
-                        contentDescription = null,
-                        tint = Color(0xFF4C505E),
-                        modifier = Modifier.size(88.dp)
+                    Text(
+                        text = "(´; ω ; ｀)",
+                        color = TextPrimaryWhite,
+                        fontSize = 34.sp,
+                        fontWeight = FontWeight.Bold
                     )
                     Spacer(modifier = Modifier.height(14.dp))
-                    Text("سجل التصفح والقراءة فارغ", color = TextPrimaryWhite, fontSize = 17.sp, fontWeight = FontWeight.Bold)
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text("ستظهر هنا جميع الصفحات والأعمال التي تقوم بزيارتها.", color = TextSecondaryGrey, fontSize = 13.sp)
+                    Text(
+                        text = "السجل فارغ.",
+                        color = Color(0xFFD5DAE6),
+                        fontSize = 15.sp
+                    )
                 }
             }
         } else {

@@ -10,7 +10,7 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface AppDao {
-    // Sites
+    // Sites / Sources
     @Query("SELECT * FROM sites ORDER BY sortOrder ASC, addedAt ASC")
     fun getAllSites(): Flow<List<SiteEntity>>
 
@@ -19,6 +19,9 @@ interface AppDao {
 
     @Query("SELECT * FROM sites ORDER BY sortOrder ASC, addedAt ASC")
     suspend fun getAllSitesOnce(): List<SiteEntity>
+
+    @Query("SELECT * FROM sites WHERE id = :id LIMIT 1")
+    suspend fun getSiteById(id: Long): SiteEntity?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertSite(site: SiteEntity): Long
@@ -74,7 +77,7 @@ interface AppDao {
     @Query("DELETE FROM history")
     suspend fun clearHistory()
 
-    // Saved Works (Storage)
+    // Saved Works (Legacy / Imported Files)
     @Query("SELECT * FROM saved_works ORDER BY createdAt DESC")
     fun getAllSavedWorks(): Flow<List<SavedWorkEntity>>
 
@@ -94,6 +97,9 @@ interface AppDao {
     @Query("SELECT * FROM download_tasks ORDER BY createdAt DESC")
     fun getAllDownloadTasks(): Flow<List<DownloadTaskEntity>>
 
+    @Query("SELECT * FROM download_tasks ORDER BY createdAt DESC")
+    suspend fun getAllDownloadTasksOnce(): List<DownloadTaskEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertDownloadTask(task: DownloadTaskEntity): Long
 
@@ -105,4 +111,64 @@ interface AppDao {
 
     @Query("DELETE FROM download_tasks")
     suspend fun clearDownloadTasks()
+
+    // Downloaded Works (Offline Manga Library in التخزين)
+    @Query("SELECT * FROM downloaded_works ORDER BY updatedAt DESC")
+    fun getAllDownloadedWorks(): Flow<List<DownloadedWorkEntity>>
+
+    @Query("SELECT * FROM downloaded_works ORDER BY updatedAt DESC")
+    suspend fun getAllDownloadedWorksOnce(): List<DownloadedWorkEntity>
+
+    @Query("SELECT * FROM downloaded_works WHERE workId = :workId LIMIT 1")
+    suspend fun getDownloadedWorkById(workId: String): DownloadedWorkEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertDownloadedWork(work: DownloadedWorkEntity)
+
+    @Query("DELETE FROM downloaded_works WHERE workId = :workId")
+    suspend fun deleteDownloadedWorkById(workId: String)
+
+    // Downloaded Chapters (Offline Chapter Files & Status)
+    @Query("SELECT * FROM downloaded_chapters ORDER BY downloadedAt DESC")
+    fun getAllDownloadedChapters(): Flow<List<DownloadedChapterEntity>>
+
+    @Query("SELECT * FROM downloaded_chapters WHERE workId = :workId ORDER BY chapterNumber ASC")
+    fun getDownloadedChaptersForWorkFlow(workId: String): Flow<List<DownloadedChapterEntity>>
+
+    @Query("SELECT * FROM downloaded_chapters WHERE workId = :workId ORDER BY chapterNumber ASC")
+    suspend fun getDownloadedChaptersForWorkOnce(workId: String): List<DownloadedChapterEntity>
+
+    @Query("SELECT * FROM downloaded_chapters WHERE chapterKey = :chapterKey LIMIT 1")
+    suspend fun getDownloadedChapterByKey(chapterKey: String): DownloadedChapterEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertDownloadedChapter(chapter: DownloadedChapterEntity)
+
+    @Query("DELETE FROM downloaded_chapters WHERE chapterKey = :chapterKey")
+    suspend fun deleteDownloadedChapterByKey(chapterKey: String)
+
+    @Query("DELETE FROM downloaded_chapters WHERE workId = :workId")
+    suspend fun deleteDownloadedChaptersForWork(workId: String)
+
+    @Query("DELETE FROM downloaded_chapters WHERE status IN ('COMPLETED', 'CANCELLED', 'FAILED')")
+    suspend fun clearCompletedAndCancelledChaptersRecord()
+
+    // Reading Progress
+    @Query("SELECT * FROM reading_progress ORDER BY lastReadAt DESC")
+    fun getAllReadingProgress(): Flow<List<ReadingProgressEntity>>
+
+    @Query("SELECT * FROM reading_progress WHERE workId = :workId ORDER BY lastReadAt DESC")
+    fun getReadingProgressForWorkFlow(workId: String): Flow<List<ReadingProgressEntity>>
+
+    @Query("SELECT * FROM reading_progress WHERE workId = :workId ORDER BY lastReadAt DESC")
+    suspend fun getReadingProgressForWorkOnce(workId: String): List<ReadingProgressEntity>
+
+    @Query("SELECT * FROM reading_progress WHERE chapterKey = :chapterKey LIMIT 1")
+    suspend fun getReadingProgressByKey(chapterKey: String): ReadingProgressEntity?
+
+    @Query("SELECT * FROM reading_progress ORDER BY lastReadAt DESC LIMIT 1")
+    suspend fun getLatestReadingProgressOnce(): ReadingProgressEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertReadingProgress(progress: ReadingProgressEntity)
 }

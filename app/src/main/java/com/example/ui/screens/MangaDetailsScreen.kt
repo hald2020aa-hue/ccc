@@ -1,7 +1,6 @@
 package com.example.ui.screens
 
 import android.content.Intent
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
@@ -41,12 +40,14 @@ import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.FindReplace
 import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.SwapVert
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -98,6 +99,7 @@ import com.example.ui.theme.PeriwinkleOnPrimary
 import com.example.ui.theme.PeriwinklePrimary
 import com.example.ui.theme.TextPrimaryWhite
 import com.example.ui.theme.TextSecondaryGrey
+import com.example.ui.viewmodel.MainViewModel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -108,12 +110,15 @@ fun MangaDetailsScreen(
     isFavorite: Boolean,
     downloadedChapterNumbers: Set<Int>,
     readChapterNumbers: Set<Int> = emptySet(),
+    resumeLabel: String = "",
     addedSites: List<SiteEntity> = emptyList(),
     onBackClick: () -> Unit,
     onOpenChapter: (MangaWork, MangaChapter) -> Unit,
     onToggleFavorite: (MangaWork) -> Unit,
     onSaveWorkToStorage: (MangaWork) -> Unit,
     onDownloadChapters: (MangaWork, List<MangaChapter>, String) -> Unit,
+    onDeleteSingleDownloadedChapter: (MangaWork, MangaChapter) -> Unit = { _, _ -> },
+    onRemoveWorkFromStorage: (String) -> Unit = {},
     onOpenInWebView: (String, String) -> Unit,
     onSelectSiteForSearch: ((SiteEntity) -> Unit)? = null,
     onShowToast: (String) -> Unit
@@ -121,8 +126,12 @@ fun MangaDetailsScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    var liveWork by remember(work.id, work.mangaUrl) { mutableStateOf(work) }
-    var isLoadingChapters by remember(work.id, work.mangaUrl) { mutableStateOf(work.chapters.isEmpty()) }
+    var liveWork by remember(work.id, work.mangaUrl, work.chapters.size, work.storageSizeBytes) {
+        mutableStateOf(work)
+    }
+    var isLoadingChapters by remember(work.id, work.mangaUrl, work.isFromLocalStorage) {
+        mutableStateOf(!work.isFromLocalStorage && work.chapters.isEmpty())
+    }
     var requiresCloudflare by remember(work.id, work.mangaUrl) { mutableStateOf(false) }
     var showProtectionModal by remember { mutableStateOf(false) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
@@ -138,43 +147,73 @@ fun MangaDetailsScreen(
         work.mangaUrl.ifBlank { "${work.siteUrl.trimEnd('/')}/series/${work.id}" }
     }
 
-    // Fetch live details & chapters from the website URL
+    // Fetch live details & chapters from the website URL when not purely offline
     LaunchedEffect(work.id, targetMangaUrl, refreshTrigger) {
+        if (work.isFromLocalStorage && refreshTrigger == 0) {
+            isLoadingChapters = false
+            return@LaunchedEffect
+        }
         if (liveWork.chapters.isEmpty() || refreshTrigger > 0) {
             isLoadingChapters = true
         }
         val res = LiveMangaSiteScraper.fetchMangaDetails(liveWork.copy(mangaUrl = targetMangaUrl))
         if (res.work.chapters.isNotEmpty() || res.work.description.isNotBlank()) {
-            liveWork = res.work
+            // Preserve local chapter paths if any were already downloaded
+            val existingLocalByNum = liveWork.chapters.associateBy { it.number }
+            val mergedChs = res.work.chapters.map { remoteCh ->
+                val localCh = existingLocalByNum[remoteCh.number]
+                if (localCh != null && localCh.localPagePaths.isNotEmpty()) {
+                    remoteCh.copy(
+                        localPagePaths = localCh.localPagePaths,
+                        downloadStatus = localCh.downloadStatus,
+                        lastReadPage = localCh.lastReadPage,
+                        lastReadTimeText = localCh.lastReadTimeText,
+                        chapterKey = localCh.chapterKey
+                    )
+                } else {
+                    remoteCh
+                }
+            }
+            liveWork = res.work.copy(
+                localCoverPath = liveWork.localCoverPath,
+                isFromLocalStorage = liveWork.isFromLocalStorage,
+                storageSizeBytes = liveWork.storageSizeBytes,
+                chapters = if (mergedChs.isNotEmpty()) mergedChs else liveWork.chapters
+            )
             requiresCloudflare = false
             isLoadingChapters = false
-        } else if (res.requiresCloudflare) {
+        } else if (res.requiresCloudflare && liveWork.chapters.isEmpty()) {
             requiresCloudflare = true
             isLoadingChapters = false
         } else {
-            // Wait briefly for HiddenSiteWebViewBridge DOM extraction
             delay(1300)
             isLoadingChapters = false
         }
     }
 
-    // Hidden WebView DOM Bridge to extract chapters & metadata rendered by JavaScript
-    HiddenSiteWebViewBridge(
-        targetUrl = targetMangaUrl,
-        jsExtractorScript = LiveMangaSiteScraper.JS_EXTRACT_DETAILS,
-        reloadTrigger = refreshTrigger,
-        onResultJson = { rawJson ->
-            val domRes = LiveMangaSiteScraper.parseDetailsFromDomJson(rawJson, liveWork)
-            if (domRes.work.chapters.isNotEmpty() || domRes.work.description.isNotBlank()) {
-                liveWork = domRes.work
-                requiresCloudflare = false
-                isLoadingChapters = false
-            } else if (domRes.requiresCloudflare && liveWork.chapters.isEmpty()) {
-                requiresCloudflare = true
-                isLoadingChapters = false
+    // Only run HiddenSiteWebViewBridge when online or explicitly refreshing
+    if (!work.isFromLocalStorage || refreshTrigger > 0) {
+        HiddenSiteWebViewBridge(
+            targetUrl = targetMangaUrl,
+            jsExtractorScript = LiveMangaSiteScraper.JS_EXTRACT_DETAILS,
+            reloadTrigger = refreshTrigger,
+            onResultJson = { rawJson ->
+                val domRes = LiveMangaSiteScraper.parseDetailsFromDomJson(rawJson, liveWork)
+                if (domRes.work.chapters.isNotEmpty() || domRes.work.description.isNotBlank()) {
+                    liveWork = domRes.work.copy(
+                        localCoverPath = liveWork.localCoverPath,
+                        isFromLocalStorage = liveWork.isFromLocalStorage,
+                        storageSizeBytes = liveWork.storageSizeBytes
+                    )
+                    requiresCloudflare = false
+                    isLoadingChapters = false
+                } else if (domRes.requiresCloudflare && liveWork.chapters.isEmpty()) {
+                    requiresCloudflare = true
+                    isLoadingChapters = false
+                }
             }
-        }
-    )
+        )
+    }
 
     fun triggerActionHint(label: String) {
         scope.launch {
@@ -190,10 +229,16 @@ fun MangaDetailsScreen(
         if (isChaptersReversed) liveWork.chapters.reversed() else liveWork.chapters
     }
 
-    // Two-Pane Split Layout matching 00:16 - 00:38 of the reference video:
-    // In RTL:
-    // - Right Pane (weight 0.45f): Manga Info, Cover, Status, Type, Rating, Chapters Count, Site, Genres, Story
-    // - Left Pane (weight 0.55f): "الفصول" Tab, Chapters List with context menu, and Bottom 5-icon Bar
+    val effectiveResumeChapter = remember(liveWork.chapters, readChapterNumbers) {
+        liveWork.chapters.firstOrNull { it.lastReadPage >= 0 }
+            ?: liveWork.chapters.firstOrNull { it.number in readChapterNumbers }
+            ?: liveWork.chapters.lastOrNull()
+    }
+    val effectiveResumeText = remember(resumeLabel, effectiveResumeChapter) {
+        resumeLabel.ifBlank { effectiveResumeChapter?.lastReadTimeText ?: "" }
+    }
+
+    // Two-Pane Split Layout matching 00:16 - 00:38 & 03:12 & 08:05 of the reference video
     Row(
         modifier = Modifier
             .fillMaxSize()
@@ -208,7 +253,6 @@ fun MangaDetailsScreen(
                 .weight(0.45f)
                 .fillMaxHeight()
         ) {
-            // Blurred Cover Artwork Backdrop (00:17 - 00:38)
             MangaCoverArtwork(
                 work = liveWork,
                 showArabicTitleBanner = false,
@@ -235,7 +279,7 @@ fun MangaDetailsScreen(
                     .fillMaxSize()
                     .padding(horizontal = 10.dp, vertical = 6.dp)
             ) {
-                // Top Row: Back Arrow + Title (00:16 - 00:38)
+                // Top Row: Back Arrow + Title
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -272,7 +316,7 @@ fun MangaDetailsScreen(
                         .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    // Cover Image (Right) + Status & Type Boxes (Left) (00:25)
+                    // Cover Image (Right) + Status & Type/Author Boxes (Left)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -313,7 +357,11 @@ fun MangaDetailsScreen(
                                 modifier = Modifier.fillMaxWidth()
                             ) {
                                 Text(
-                                    text = "النوع:\n${liveWork.type}",
+                                    text = if (liveWork.author.isNotBlank() && liveWork.author != "غير معروف") {
+                                        "المؤلف:\n${liveWork.author}"
+                                    } else {
+                                        "النوع:\n${liveWork.type}"
+                                    },
                                     color = TextPrimaryWhite,
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Bold,
@@ -325,7 +373,7 @@ fun MangaDetailsScreen(
                         }
                     }
 
-                    // Rating ★ + Read 📖 + Web/Protection 🌐 Bar (00:17 - 00:38)
+                    // Rating ★ + Read 📖 + Web/Protection 🌐 Bar
                     Surface(
                         color = Color(0xD9171A22),
                         shape = RoundedCornerShape(10.dp),
@@ -361,9 +409,9 @@ fun MangaDetailsScreen(
 
                             IconButton(
                                 onClick = {
-                                    val firstChapter = liveWork.chapters.firstOrNull()
-                                    if (firstChapter != null) {
-                                        onOpenChapter(liveWork, firstChapter)
+                                    val targetChapter = effectiveResumeChapter ?: liveWork.chapters.firstOrNull()
+                                    if (targetChapter != null) {
+                                        onOpenChapter(liveWork, targetChapter)
                                     } else {
                                         onShowToast("جاري جلب الفصول من الموقع...")
                                     }
@@ -398,7 +446,7 @@ fun MangaDetailsScreen(
                         }
                     }
 
-                    // Chapters Count + Source Site Row (00:25 - 00:38)
+                    // Chapters Count + Source / Storage Size Row (matching 03:12 & 08:05: التخزين / ٢٨ MB | عدد الفصول 1)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -429,30 +477,51 @@ fun MangaDetailsScreen(
                             border = BorderStroke(1.dp, Color(0xFF2E3342)),
                             modifier = Modifier.weight(1f)
                         ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.Center,
-                                modifier = Modifier.padding(vertical = 8.dp, horizontal = 4.dp)
-                            ) {
-                                Text(
-                                    text = liveWork.siteName.substringAfterLast("- ").trim().ifBlank { liveWork.siteName },
-                                    color = TextPrimaryWhite,
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                SiteIconBadge(
-                                    iconKey = liveWork.siteIconKey,
-                                    siteName = liveWork.siteName,
-                                    size = 16.dp
-                                )
+                            if (liveWork.isFromLocalStorage || liveWork.storageSizeBytes > 0L) {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    modifier = Modifier.padding(vertical = 6.dp, horizontal = 4.dp)
+                                ) {
+                                    Text(
+                                        text = "التخزين",
+                                        color = TextSecondaryGrey,
+                                        fontSize = 9.sp,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    Text(
+                                        text = MainViewModel.formatBytesArabic(liveWork.storageSizeBytes.coerceAtLeast(1024L)),
+                                        color = TextPrimaryWhite,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1
+                                    )
+                                }
+                            } else {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.Center,
+                                    modifier = Modifier.padding(vertical = 8.dp, horizontal = 4.dp)
+                                ) {
+                                    Text(
+                                        text = liveWork.siteName.substringAfterLast("- ").trim().ifBlank { liveWork.siteName },
+                                        color = TextPrimaryWhite,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    SiteIconBadge(
+                                        iconKey = liveWork.siteIconKey,
+                                        siteName = liveWork.siteName,
+                                        size = 16.dp
+                                    )
+                                }
                             }
                         }
                     }
 
-                    // Genre Chips (00:25 - 00:38)
+                    // Genre Chips
                     if (liveWork.genres.isNotEmpty()) {
                         liveWork.genres.chunked(2).forEach { pair ->
                             Row(
@@ -481,7 +550,7 @@ fun MangaDetailsScreen(
                         }
                     }
 
-                    // Story Synopsis scraped from the site (00:25 - 00:38)
+                    // Story Synopsis
                     if (liveWork.description.isNotBlank()) {
                         Surface(
                             color = Color(0xB312151E),
@@ -512,7 +581,7 @@ fun MangaDetailsScreen(
                 .fillMaxHeight()
                 .background(AppBackgroundDark)
         ) {
-            // Top "الفصول" Tab Header (00:16 - 00:38)
+            // Top "الفصول" Tab Header
             Column(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalAlignment = Alignment.CenterHorizontally
@@ -535,7 +604,67 @@ fun MangaDetailsScreen(
                 HorizontalDivider(color = AppDividerColor, thickness = 1.dp)
             }
 
-            // Chapters Content Area (00:16-00:24 Skeleton -> 00:25-00:38 Chapters List)
+            // Exact "إستمر" Resume Reading Banner from 08:05 & 08:25:
+            // "قبل 6 ثوان • الصفحة 21" + "إستمر ▶" pill button
+            if (effectiveResumeChapter != null && effectiveResumeText.isNotBlank()) {
+                Surface(
+                    color = Color(0xFF191D28),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onOpenChapter(liveWork, effectiveResumeChapter) }
+                        .testTag("details_resume_reading_banner")
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = effectiveResumeChapter.title,
+                                color = TextPrimaryWhite,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1
+                            )
+                            Text(
+                                text = effectiveResumeText,
+                                color = TextSecondaryGrey,
+                                fontSize = 10.sp,
+                                maxLines = 1
+                            )
+                        }
+                        Surface(
+                            color = Color(0xFF283149),
+                            shape = RoundedCornerShape(16.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "إستمر",
+                                    color = PeriwinklePrimary,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Spacer(modifier = Modifier.width(3.dp))
+                                Icon(
+                                    imageVector = Icons.Default.PlayArrow,
+                                    contentDescription = null,
+                                    tint = PeriwinklePrimary,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+                HorizontalDivider(color = AppDividerColor, thickness = 1.dp)
+            }
+
+            // Chapters Content Area
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -580,7 +709,6 @@ fun MangaDetailsScreen(
                         )
                     }
                 } else if (displayedChapters.isEmpty()) {
-                    // Prompt to verify Cloudflare or retry fetching chapters
                     Column(
                         modifier = Modifier
                             .fillMaxSize()
@@ -629,8 +757,10 @@ fun MangaDetailsScreen(
                         contentPadding = PaddingValues(vertical = 6.dp)
                     ) {
                         items(displayedChapters, key = { it.id }) { chapter ->
-                            val isSaved = chapter.number in downloadedChapterNumbers
-                            val isRead = chapter.number in readChapterNumbers
+                            val isSaved = (chapter.number in downloadedChapterNumbers) ||
+                                (chapter.localPagePaths.isNotEmpty() && chapter.downloadStatus == "COMPLETED")
+                            val isIncomplete = chapter.downloadStatus == "INCOMPLETE"
+                            val isRead = (chapter.number in readChapterNumbers) || (chapter.lastReadPage >= 0)
                             val showMenuForThis = activeChapterMenuId == chapter.id
 
                             Box(modifier = Modifier.fillMaxWidth()) {
@@ -645,7 +775,7 @@ fun MangaDetailsScreen(
                                         .testTag("chapter_row_${chapter.number}"),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    // Right side in RTL: Circular Chapter Number Badge (clickable to open download menu)
+                                    // Right side in RTL: Circular Chapter Number / Checkmark Badge
                                     Box(
                                         modifier = Modifier
                                             .size(34.dp)
@@ -653,6 +783,7 @@ fun MangaDetailsScreen(
                                             .background(
                                                 when {
                                                     isSaved -> Color(0xFF1E3B2B)
+                                                    isIncomplete -> Color(0xFF3E2723)
                                                     isRead -> Color(0xFF232838)
                                                     else -> Color(0xFF1A1D26)
                                                 }
@@ -661,6 +792,7 @@ fun MangaDetailsScreen(
                                                 width = 1.dp,
                                                 color = when {
                                                     isSaved -> Color(0xFF4CAF50)
+                                                    isIncomplete -> Color(0xFFFF8A80)
                                                     isRead -> PeriwinklePrimary.copy(alpha = 0.6f)
                                                     else -> Color(0xFF3E4352)
                                                 },
@@ -670,20 +802,31 @@ fun MangaDetailsScreen(
                                             .testTag("chapter_badge_${chapter.number}"),
                                         contentAlignment = Alignment.Center
                                     ) {
-                                        if (isSaved) {
-                                            Icon(
-                                                imageVector = Icons.Default.Check,
-                                                contentDescription = "محفوظ",
-                                                tint = Color(0xFF4CAF50),
-                                                modifier = Modifier.size(16.dp)
-                                            )
-                                        } else {
-                                            Text(
-                                                text = chapter.number.toString(),
-                                                color = if (isRead) PeriwinklePrimary else TextPrimaryWhite,
-                                                fontSize = 12.sp,
-                                                fontWeight = FontWeight.Bold
-                                            )
+                                        when {
+                                            isSaved -> {
+                                                Icon(
+                                                    imageVector = Icons.Default.Check,
+                                                    contentDescription = "محفوظ",
+                                                    tint = Color(0xFF4CAF50),
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                            }
+                                            isIncomplete -> {
+                                                Icon(
+                                                    imageVector = Icons.Default.Warning,
+                                                    contentDescription = "غير مكتمل",
+                                                    tint = Color(0xFFFF8A80),
+                                                    modifier = Modifier.size(15.dp)
+                                                )
+                                            }
+                                            else -> {
+                                                Text(
+                                                    text = chapter.number.toString(),
+                                                    color = if (isRead) PeriwinklePrimary else TextPrimaryWhite,
+                                                    fontSize = 12.sp,
+                                                    fontWeight = FontWeight.Bold
+                                                )
+                                            }
                                         }
                                     }
 
@@ -702,26 +845,32 @@ fun MangaDetailsScreen(
                                             overflow = TextOverflow.Ellipsis
                                         )
                                         val subText = buildList {
-                                            if (chapter.dateText.isNotBlank()) add(chapter.dateText)
-                                            if (isSaved) add("تم التنزيل")
-                                            if (isRead) add("مقروء")
+                                            if (chapter.lastReadTimeText.isNotBlank()) {
+                                                add(chapter.lastReadTimeText)
+                                            } else if (chapter.dateText.isNotBlank()) {
+                                                add(chapter.dateText)
+                                            }
+                                            if (isSaved) add("محفوظ بدون إنترنت")
+                                            if (isIncomplete) add("غير مكتمل")
+                                            if (isRead && chapter.lastReadTimeText.isBlank()) add("مقروء")
                                         }.joinToString(" • ")
 
                                         if (subText.isNotBlank()) {
                                             Spacer(modifier = Modifier.height(2.dp))
                                             Text(
                                                 text = subText,
-                                                color = if (isSaved) Color(0xFF81C784) else TextSecondaryGrey,
+                                                color = when {
+                                                    isIncomplete -> Color(0xFFFF8A80)
+                                                    isSaved -> Color(0xFF81C784)
+                                                    else -> TextSecondaryGrey
+                                                },
                                                 fontSize = 11.sp
                                             )
                                         }
                                     }
                                 }
 
-                                // Exact Chapter Context Menu from 00:27 - 00:28:
-                                // "حفظ هذا الفصل"
-                                // "تنزيل هذا الفصل والفصول السابقة"
-                                // "تنزيل هذا الفصل والفصول التالية"
+                                // Chapter Context Menu (00:27 - 00:28 + Offline Delete option)
                                 DropdownMenu(
                                     expanded = showMenuForThis,
                                     onDismissRequest = { activeChapterMenuId = null },
@@ -741,7 +890,7 @@ fun MangaDetailsScreen(
                                             onDownloadChapters(
                                                 liveWork,
                                                 listOf(chapter),
-                                                "تم حفظ ${chapter.title} في التخزين"
+                                                "بدأ التنزيل 😭"
                                             )
                                         }
                                     )
@@ -760,7 +909,7 @@ fun MangaDetailsScreen(
                                             onDownloadChapters(
                                                 liveWork,
                                                 previousAndCurrent,
-                                                "تم تنزيل ${previousAndCurrent.size} فصل (الفصل ${chapter.number} والسابقة)"
+                                                "بدأ التنزيل 😭 (${previousAndCurrent.size} فصل)"
                                             )
                                         }
                                     )
@@ -779,17 +928,33 @@ fun MangaDetailsScreen(
                                             onDownloadChapters(
                                                 liveWork,
                                                 nextAndCurrent,
-                                                "تم تنزيل ${nextAndCurrent.size} فصل (الفصل ${chapter.number} والتالية)"
+                                                "بدأ التنزيل 😭 (${nextAndCurrent.size} فصل)"
                                             )
                                         }
                                     )
+                                    if (isSaved || isIncomplete) {
+                                        DropdownMenuItem(
+                                            text = {
+                                                Text(
+                                                    text = "حذف الفصل المحلي",
+                                                    color = Color(0xFFFF8A80),
+                                                    fontSize = 14.sp,
+                                                    fontWeight = FontWeight.SemiBold
+                                                )
+                                            },
+                                            onClick = {
+                                                activeChapterMenuId = null
+                                                onDeleteSingleDownloadedChapter(liveWork, chapter)
+                                            }
+                                        )
+                                    }
                                 }
                             }
                         }
                     }
                 }
 
-                // Floating Tooltip Pill above Bottom Action Bar (00:32, 00:33, 00:34, 00:35)
+                // Floating Tooltip Pill above Bottom Action Bar
                 androidx.compose.animation.AnimatedVisibility(
                     visible = bottomActionHint != null,
                     enter = fadeIn(),
@@ -814,7 +979,7 @@ fun MangaDetailsScreen(
                 }
             }
 
-            // Bottom 5-Icon Bar matching 00:16 - 00:38 (♡, ⇅, 💾, 🔄, ⋮ from left to right)
+            // Bottom 5-Icon Bar matching 00:16 - 00:38 & 08:31 - 08:32
             HorizontalDivider(color = AppDividerColor, thickness = 1.dp)
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
                 Row(
@@ -826,7 +991,7 @@ fun MangaDetailsScreen(
                     horizontalArrangement = Arrangement.Start,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // 1. Heart Icon: أضف إلى المفضلة (00:35)
+                    // 1. Heart Icon: أضف إلى المفضلة
                     IconButton(
                         onClick = {
                             triggerActionHint("أضف إلى المفضلة")
@@ -842,7 +1007,7 @@ fun MangaDetailsScreen(
                         )
                     }
 
-                    // 2. Reverse Chapters Icon: عكس الفصول (00:34)
+                    // 2. Reverse Chapters Icon: عكس الفصول
                     IconButton(
                         onClick = {
                             isChaptersReversed = !isChaptersReversed
@@ -858,7 +1023,7 @@ fun MangaDetailsScreen(
                         )
                     }
 
-                    // 3. Save / Download Icon: حفظ (00:33)
+                    // 3. Save / Download Icon: حفظ
                     IconButton(
                         onClick = {
                             triggerActionHint("حفظ")
@@ -874,7 +1039,7 @@ fun MangaDetailsScreen(
                         )
                     }
 
-                    // 4. Search in Added Sites Icon: البحث عن هذا العمل في المواقع المضافة (00:32)
+                    // 4. Search in Added Sites Icon: البحث عن هذا العمل في المواقع المضافة
                     IconButton(
                         onClick = {
                             triggerActionHint("البحث عن هذا العمل في المواقع المضافة")
@@ -890,8 +1055,8 @@ fun MangaDetailsScreen(
                         )
                     }
 
-                    // 5. Three-dots Overflow Menu (00:30):
-                    // تحديث الصفحة / انشاء اختصار / الإبلاغ / شارك / فتح في ...
+                    // 5. Three-dots Overflow Menu (00:30 & 08:31-08:32):
+                    // تحديث الصفحة / تحديث الغلاف / انشاء اختصار / الإبلاغ / شارك / تصدير / إزالة / فتح في ...
                     Box {
                         IconButton(
                             onClick = { showOverflowMenu = true },
@@ -926,6 +1091,23 @@ fun MangaDetailsScreen(
                                     onShowToast("جاري تحديث الفصول من الموقع...")
                                 }
                             )
+                            if (liveWork.isFromLocalStorage) {
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            "تحديث الغلاف",
+                                            color = TextPrimaryWhite,
+                                            fontSize = 14.sp,
+                                            modifier = Modifier.fillMaxWidth(),
+                                            textAlign = TextAlign.End
+                                        )
+                                    },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onShowToast("تم تحديث غلاف المانجا المحلي")
+                                    }
+                                )
+                            }
                             DropdownMenuItem(
                                 text = {
                                     Text(
@@ -980,21 +1162,54 @@ fun MangaDetailsScreen(
                                     }
                                 }
                             )
-                            DropdownMenuItem(
-                                text = {
-                                    Text(
-                                        "فتح في ...",
-                                        color = TextPrimaryWhite,
-                                        fontSize = 14.sp,
-                                        modifier = Modifier.fillMaxWidth(),
-                                        textAlign = TextAlign.End
-                                    )
-                                },
-                                onClick = {
-                                    showOverflowMenu = false
-                                    onOpenInWebView(targetMangaUrl, liveWork.title)
-                                }
-                            )
+                            if (liveWork.isFromLocalStorage) {
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            "تصدير",
+                                            color = TextPrimaryWhite,
+                                            fontSize = 14.sp,
+                                            modifier = Modifier.fillMaxWidth(),
+                                            textAlign = TextAlign.End
+                                        )
+                                    },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onShowToast("تم تصدير نسخة من الفصول المحفوظة")
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            "إزالة",
+                                            color = Color(0xFFFF8A80),
+                                            fontSize = 14.sp,
+                                            modifier = Modifier.fillMaxWidth(),
+                                            textAlign = TextAlign.End
+                                        )
+                                    },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onRemoveWorkFromStorage(liveWork.id)
+                                    }
+                                )
+                            } else {
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            "فتح في ...",
+                                            color = TextPrimaryWhite,
+                                            fontSize = 14.sp,
+                                            modifier = Modifier.fillMaxWidth(),
+                                            textAlign = TextAlign.End
+                                        )
+                                    },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onOpenInWebView(targetMangaUrl, liveWork.title)
+                                    }
+                                )
+                            }
                         }
                     }
                 }
@@ -1002,78 +1217,64 @@ fun MangaDetailsScreen(
         }
     }
 
-    // Dialog for Save / Download Manga or Chapters ("حفظ" button at 00:33)
+    // Dialog for Save / Download Manga or Chapters ("حفظ" button at 00:33 & 07:03)
     if (showDownloadMangaDialog) {
+        val totalCh = liveWork.chapters.size.coerceAtLeast(1)
         AlertDialog(
             onDismissRequest = { showDownloadMangaDialog = false },
             containerColor = AppDialogSurface,
             title = {
-                Text("حفظ وتنزيل المانجا أو الفصول", color = TextPrimaryWhite, fontWeight = FontWeight.Bold)
+                Text("حفظ المانجا", color = TextPrimaryWhite, fontWeight = FontWeight.Bold)
             },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(
-                        text = "اختر طريقة حفظ العمل «${liveWork.title}» في التخزين المحلي:",
-                        color = TextSecondaryGrey,
-                        fontSize = 13.sp
+                        text = "سيتم حفظ المانجا (جميع $totalCh الفصول).",
+                        color = TextPrimaryWhite,
+                        fontSize = 14.sp
                     )
-                    Button(
-                        onClick = {
-                            showDownloadMangaDialog = false
-                            onSaveWorkToStorage(liveWork)
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = PeriwinklePrimary,
-                            contentColor = PeriwinkleOnPrimary
-                        ),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("حفظ المانجا في مكتبة التخزين", fontWeight = FontWeight.Bold)
-                    }
-                    if (liveWork.chapters.isNotEmpty()) {
-                        Button(
+                    if (liveWork.chapters.size > 1) {
+                        OutlinedButton(
                             onClick = {
                                 showDownloadMangaDialog = false
                                 val firstFive = liveWork.chapters.take(5)
-                                onDownloadChapters(liveWork, firstFive, "تم تنزيل أول ${firstFive.size} فصول وحفظ العمل في التخزين")
+                                onDownloadChapters(liveWork, firstFive, "بدأ التنزيل 😭")
                             },
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = Color(0xFF283044),
-                                contentColor = TextPrimaryWhite
-                            ),
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            Text("تنزيل أول 5 فصول للقراءة بدون إنترنت", fontWeight = FontWeight.SemiBold)
-                        }
-                        Button(
-                            onClick = {
-                                showDownloadMangaDialog = false
-                                onDownloadChapters(
-                                    liveWork,
-                                    liveWork.chapters,
-                                    "تم بدء تنزيل جميع الفصول (${liveWork.chapters.size} فصل)"
-                                )
-                            },
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = Color(0xFF283044),
-                                contentColor = TextPrimaryWhite
-                            ),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("تنزيل جميع الفصول (${liveWork.chapters.size} فصل)", fontWeight = FontWeight.SemiBold)
+                            Text("تنزيل أول 5 فصول فقط", color = PeriwinklePrimary)
                         }
                     }
                 }
             },
             confirmButton = {
+                TextButton(
+                    onClick = {
+                        showDownloadMangaDialog = false
+                        if (liveWork.chapters.isNotEmpty()) {
+                            onDownloadChapters(
+                                liveWork,
+                                liveWork.chapters,
+                                "بدأ التنزيل 😭"
+                            )
+                        } else {
+                            onSaveWorkToStorage(liveWork)
+                        }
+                    },
+                    modifier = Modifier.testTag("details_confirm_save_all_btn")
+                ) {
+                    Text("حسنا", color = PeriwinklePrimary, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
                 TextButton(onClick = { showDownloadMangaDialog = false }) {
-                    Text("إغلاق", color = PeriwinklePrimary)
+                    Text("إلغاء", color = PeriwinklePrimary)
                 }
             }
         )
     }
 
-    // Dialog for Cross-Site Search ("البحث عن هذا العمل في المواقع المضافة" at 00:32)
+    // Dialog for Cross-Site Search ("البحث عن هذا العمل في المواقع المضافة")
     if (showSearchInSitesDialog) {
         AlertDialog(
             onDismissRequest = { showSearchInSitesDialog = false },

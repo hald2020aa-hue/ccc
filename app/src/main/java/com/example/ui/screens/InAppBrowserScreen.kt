@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
+import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -43,6 +44,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.OpenInBrowser
 import androidx.compose.material.icons.filled.Refresh
@@ -68,7 +70,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -85,12 +86,47 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.ui.theme.AppBackgroundDark
-import com.example.ui.theme.AppDialogSurface
 import com.example.ui.theme.PeriwinkleOnPrimary
 import com.example.ui.theme.PeriwinklePrimary
 import com.example.ui.theme.TextPrimaryWhite
 import com.example.ui.theme.TextSecondaryGrey
 import java.net.URLEncoder
+
+/**
+ * Native Android SourceWebView alias matching Section 2 of the executive specification.
+ */
+@Composable
+fun SourceWebView(
+    initialUrl: String,
+    currentTitle: String,
+    coachmarkAlreadyShown: Boolean,
+    onUpdatePageState: (String, String) -> Unit,
+    onRecordVisit: (String, String) -> Unit,
+    onMarkCoachmarkShown: () -> Unit,
+    onAddSiteFromBrowser: (String) -> Unit,
+    onToggleFavorite: (String, String) -> Unit,
+    onSavePageToStorage: (String, String) -> Unit,
+    onOpenCurrentUrlInReader: (String, String) -> Unit = { _, _ -> },
+    onShowToast: (String) -> Unit,
+    onRecordSearch: () -> Unit,
+    onCloseBrowser: () -> Unit
+) {
+    InAppBrowserScreen(
+        initialUrl = initialUrl,
+        currentTitle = currentTitle,
+        coachmarkAlreadyShown = coachmarkAlreadyShown,
+        onUpdatePageState = onUpdatePageState,
+        onRecordVisit = onRecordVisit,
+        onMarkCoachmarkShown = onMarkCoachmarkShown,
+        onAddSiteFromBrowser = onAddSiteFromBrowser,
+        onToggleFavorite = onToggleFavorite,
+        onSavePageToStorage = onSavePageToStorage,
+        onOpenCurrentUrlInReader = onOpenCurrentUrlInReader,
+        onShowToast = onShowToast,
+        onRecordSearch = onRecordSearch,
+        onCloseBrowser = onCloseBrowser
+    )
+}
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -104,6 +140,7 @@ fun InAppBrowserScreen(
     onAddSiteFromBrowser: (String) -> Unit,
     onToggleFavorite: (String, String) -> Unit,
     onSavePageToStorage: (String, String) -> Unit,
+    onOpenCurrentUrlInReader: (String, String) -> Unit = { _, _ -> },
     onShowToast: (String) -> Unit,
     onRecordSearch: () -> Unit,
     onCloseBrowser: () -> Unit
@@ -282,12 +319,29 @@ fun InAppBrowserScreen(
                                 )
                             }
 
-                            // Exact Overflow Menu from 00:26 + helpful actions
                             DropdownMenu(
                                 expanded = showOverflowMenu,
                                 onDismissRequest = { showOverflowMenu = false },
                                 containerColor = Color(0xFF23262F)
                             ) {
+                                if (isNonGoogleSite) {
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                text = "فتح الصفحة في القارئ المدمج",
+                                                color = TextPrimaryWhite,
+                                                fontSize = 15.sp
+                                            )
+                                        },
+                                        leadingIcon = {
+                                            Icon(Icons.Default.MenuBook, null, tint = PeriwinklePrimary)
+                                        },
+                                        onClick = {
+                                            showOverflowMenu = false
+                                            onOpenCurrentUrlInReader(activeTitle, activeUrl)
+                                        }
+                                    )
+                                }
                                 DropdownMenuItem(
                                     text = {
                                         Text(
@@ -398,11 +452,18 @@ fun InAppBrowserScreen(
                     modifier = Modifier.fillMaxSize(),
                     factory = { ctx ->
                         WebView(ctx).apply {
+                            val cookieManager = CookieManager.getInstance()
+                            cookieManager.setAcceptCookie(true)
+                            cookieManager.setAcceptThirdPartyCookies(this, true)
+
                             settings.apply {
                                 javaScriptEnabled = true
                                 domStorageEnabled = true
                                 databaseEnabled = true
                                 loadsImagesAutomatically = true
+                                // Section 11: Strict WebView security settings
+                                allowFileAccess = false
+                                allowContentAccess = false
                                 mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
                                 useWideViewPort = true
                                 loadWithOverviewMode = true
@@ -426,6 +487,10 @@ fun InAppBrowserScreen(
                                 override fun onPageFinished(view: WebView?, url: String?) {
                                     super.onPageFinished(view, url)
                                     isLoading = false
+                                    try {
+                                        CookieManager.getInstance().flush()
+                                    } catch (_: Exception) {
+                                    }
                                     val finalUrl = url ?: activeUrl
                                     val pageTitle = view?.title ?: ""
                                     activeUrl = finalUrl
@@ -562,7 +627,6 @@ fun InAppBrowserScreen(
                     }
             ) {
                 Canvas(modifier = Modifier.fillMaxSize()) {
-                    // Large translucent periwinkle spotlight circle anchored around bottom-left
                     drawCircle(
                         color = Color(0xD97986CB),
                         radius = size.width * 0.78f,
@@ -605,7 +669,6 @@ fun InAppBrowserScreen(
         }
 
         // Bottom-Left Floating "إضافة موقع" Button (00:27-00:46)
-        // Note: In RTL, Alignment.BottomEnd is the bottom-left of the screen!
         Button(
             onClick = {
                 showCoachmark = false
